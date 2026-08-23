@@ -1,0 +1,19 @@
+{
+  "name": "yopisora-bot",
+  "version": "5.0.0",
+  "description": "Discord bot for Seedance 2.5 and Seedance 2.0 Fast video generation",
+  "main": "src/bot.js",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "start": "node src/bot.js",
+    "register": "node src/register.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "discord.js": "^14.27.0",
+    "dotenv": "^17.4.2"
+  }
+}
