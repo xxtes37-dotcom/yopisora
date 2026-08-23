@@ -6,6 +6,7 @@ import {
   MessageFlags,
   ActivityType,
   AttachmentBuilder,
+  Options,
 } from 'discord.js';
 import {
   BoxClient,
@@ -40,8 +41,13 @@ import {
   DEFAULT_POLL_INTERVAL_MS,
   DEFAULT_VIDEO_TIMEOUT_MS,
 } from './boxverse.js';
-import { createReadStream } from 'node:fs';
-import { unlink } from 'node:fs/promises';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { unlink, stat, writeFile } from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
+import { randomBytes } from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
 import { createSlotManager } from './slots.js';
 import { createJobStore } from './jobstore.js';
 
@@ -119,26 +125,61 @@ const MAX_VIDEO_BYTES = 50 * MB;
 const MIN_IMAGE_DIMENSION = 300;
 const fmtMB = (bytes) => `${(bytes / MB).toFixed(1)} MB`;
 
-const fetchAttachmentBytes = async (attachment) => {
+const fetchAttachmentToFile = async (attachment) => {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 60_000);
+  const filePath = path.join(os.tmpdir(), `yopisora-ref-${randomBytes(8).toString('hex')}`);
   try {
     const resp = await fetch(attachment.url, { signal: ctrl.signal });
     if (!resp.ok) {
       throw new Error(`Could not download ${attachment.name}.`);
     }
-    const buffer = Buffer.from(await resp.arrayBuffer());
+    // Stream Discord's copy straight to disk — never hold the reference file in
+    // the heap. It's read back lazily during the multipart upload.
+    if (resp.body && typeof Readable.fromWeb === 'function') {
+      await pipeline(Readable.fromWeb(resp.body), createWriteStream(filePath));
+    } else {
+      await writeFile(filePath, Buffer.from(await resp.arrayBuffer()));
+    }
+    const { size } = await stat(filePath);
     return {
-      data: buffer,
+      path: filePath,
       filename: attachment.name || 'file',
       contentType: attachment.contentType || 'application/octet-stream',
+      bytes: size,
     };
+  } catch (err) {
+    await safeUnlink(filePath);
+    throw err;
   } finally {
     clearTimeout(timer);
   }
 };
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+// On a 1 GB host, unbounded discord.js caches are a slow-motion OOM — messages
+// the bot posts and users it fetches accumulate for the whole uptime. Keep only
+// what's actually used and sweep the rest. Essential managers (guilds, channels,
+// roles) keep their defaults via the spread.
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds],
+  makeCache: Options.cacheWithLimits({
+    ...Options.DefaultMakeCacheSettings,
+    MessageManager: 15,
+    UserManager: { maxSize: 40, keepOverLimit: (user) => user.id === client.user?.id },
+    GuildMemberManager: { maxSize: 40, keepOverLimit: (member) => member.id === client.user?.id },
+    PresenceManager: 0,
+    ThreadManager: 0,
+    ReactionManager: 0,
+    ReactionUserManager: 0,
+    GuildEmojiManager: 0,
+    GuildStickerManager: 0,
+  }),
+  sweepers: {
+    ...Options.DefaultSweeperSettings,
+    messages: { interval: 300, lifetime: 600 },
+    users: { interval: 3600, filter: () => (user) => user.id !== client.user?.id },
+  },
+});
 
 client.once('clientReady', async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
@@ -397,14 +438,22 @@ async function runGeneration(interaction, {
       await finalise(uploading);
 
       for (const att of imgAtts) {
-        const file = await fetchAttachmentBytes(att);
-        const url = await box.uploadReference(session, file);
-        references.push({ type: 'image', url });
+        const file = await fetchAttachmentToFile(att);
+        try {
+          const url = await box.uploadReference(session, file);
+          references.push({ type: 'image', url });
+        } finally {
+          await safeUnlink(file.path);
+        }
       }
       for (const att of vidAtts) {
-        const file = await fetchAttachmentBytes(att);
-        const url = await box.uploadReference(session, file);
-        references.push({ type: 'video', url });
+        const file = await fetchAttachmentToFile(att);
+        try {
+          const url = await box.uploadReference(session, file);
+          references.push({ type: 'video', url });
+        } finally {
+          await safeUnlink(file.path);
+        }
       }
     }
 

@@ -15,7 +15,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
+import { createReadStream, createWriteStream } from 'node:fs';
 import { unlink, stat, writeFile } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
@@ -226,23 +226,28 @@ export class BoxClient {
    * @returns {Promise<string>} media URL
    */
   async uploadReference(session, file) {
+    // file: { path, filename, contentType, bytes } — streamed straight from disk
+    // so a large (up to 50 MB) video reference never sits buffered, let alone
+    // doubled by a Buffer.concat, in the JS heap.
     const boundary = `----BoxBoundary${randomBytes(8).toString('hex')}`;
-    const parts = [];
-
-    // file part
-    parts.push(
+    const preamble =
       `--${boundary}\r\n` +
       `Content-Disposition: form-data; name="file"; filename="${file.filename}"\r\n` +
-      `Content-Type: ${file.contentType}\r\n\r\n`,
-    );
+      `Content-Type: ${file.contentType}\r\n\r\n`;
     const closing = `\r\n--${boundary}--\r\n`;
+    const preBuf = Buffer.from(preamble, 'utf8');
+    const closeBuf = Buffer.from(closing, 'utf8');
 
-    // Assemble multipart body
-    const bodyBuffer = Buffer.concat([
-      Buffer.from(parts[0], 'utf8'),
-      file.data,
-      Buffer.from(closing, 'utf8'),
-    ]);
+    // The exact body length is known up front, so we can set Content-Length and
+    // stream the body — no chunked transfer-encoding, byte-identical to the old
+    // buffered request the provider already accepted.
+    const contentLength = preBuf.length + file.bytes + closeBuf.length;
+
+    async function* multipartBody() {
+      yield preBuf;
+      for await (const chunk of createReadStream(file.path)) yield chunk;
+      yield closeBuf;
+    }
 
     const resp = await this.#fetchWithTimeout(`${API_BASE}/api/v1/studio/uploads`, {
       method: 'POST',
@@ -250,8 +255,10 @@ export class BoxClient {
         ...DEFAULT_HEADERS,
         Authorization: `Bearer ${session.accessToken}`,
         'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': String(contentLength),
       },
-      body: bodyBuffer,
+      body: Readable.from(multipartBody()),
+      duplex: 'half',
     }, UPLOAD_REQUEST_TIMEOUT_MS);
 
     if (!resp.ok) {

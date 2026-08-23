@@ -5,7 +5,7 @@
   "main": "src/bot.js",
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "start": "node src/bot.js",
+    "start": "node --max-old-space-size=640 src/bot.js",
     "register": "node src/register.js"
   },
   "keywords": [],
