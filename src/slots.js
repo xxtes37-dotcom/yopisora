@@ -31,11 +31,12 @@ export function createSlotManager({ maxPerUser = 3, maxJobAgeMs = 960_000, now =
   };
 
   return {
-    /** Returns a job id, or null when the user is at their limit. */
-    take(userId) {
+    /** Returns a job id, or null when the user is at their limit.
+     *  Pass unlimited=true to bypass the per-user cap entirely. */
+    take(userId, unlimited = false) {
       prune(userId);
       const jobs = users.get(userId) ?? new Map();
-      if (jobs.size >= maxPerUser) return null;
+      if (!unlimited && jobs.size >= maxPerUser) return null;
       const jobId = randomUUID();
       jobs.set(jobId, now());
       users.set(userId, jobs);

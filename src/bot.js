@@ -74,7 +74,16 @@ const slots = createSlotManager({
   maxPerUser: MAX_PER_USER,
   maxJobAgeMs: VIDEO_TIMEOUT + 60_000,
 });
-const takeSlot = (userId) => slots.take(userId);
+// User IDs exempt from the per-user concurrency cap (comma-separated in .env,
+// plus a hardcoded default).
+const UNLIMITED_USER_IDS = new Set(
+  ['905654090632138802', ...String(process.env.GEN_UNLIMITED_USER_IDS || '').split(',')]
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
+const isUnlimited = (userId) => UNLIMITED_USER_IDS.has(String(userId));
+
+const takeSlot = (userId) => slots.take(userId, isUnlimited(userId));
 const releaseSlot = (userId, jobId) => slots.release(userId, jobId);
 const runningCount = (userId) => slots.running(userId);
 
