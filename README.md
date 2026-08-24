@@ -5,14 +5,6 @@ Model Studio / DashScope).
 
 ## Commands
 
-`/wan-3` — WAN 3.0 (Alibaba Cloud Model Studio, your paid key)
-- `prompt` (required)
-- `duration` — 5, 10 (default), 15, 20, 25, 30 seconds
-- `ratio` — 16:9 (default), 9:16
-- `resolution` — 480p, 720p (default)
-- `img1`–`img4` — optional reference images
-- `vid1` — optional reference video
-
 `/flux-3` — FLUX 3 (Synthesia AI Playground, free disposable accounts)
 - `prompt` (required)
 - `duration` — 5, 10 (default), 15, 20 seconds

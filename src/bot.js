@@ -11,19 +11,6 @@ import {
 import { createReadStream } from 'node:fs';
 import { unlink } from 'node:fs/promises';
 import {
-  WanClient,
-  WanError,
-  classifyWanFailure,
-  WAN_DURATIONS,
-  WAN_DEFAULT_DURATION,
-  WAN_RATIOS,
-  WAN_DEFAULT_RATIO,
-  WAN_RESOLUTIONS,
-  WAN_DEFAULT_RESOLUTION,
-  WAN_MAX_IMAGES,
-  WAN_MAX_VIDEOS,
-} from './wan.js';
-import {
   FluxClient,
   FluxError,
   FLUX_DURATIONS,
@@ -46,7 +33,7 @@ import { createJobStore } from './jobstore.js';
 const {
   DISCORD_TOKEN,
   DISCORD_GUILD_ID,
-  DASHSCOPE_API_KEY,
+  ARK_API_KEY,
   GEN_POLL_INTERVAL_MS = '15000',
   GEN_VIDEO_TIMEOUT_MS = '1200000',
   GEN_MAX_CONCURRENT_PER_USER = '3',
@@ -60,12 +47,11 @@ if (!DISCORD_GUILD_ID) {
   console.error('DISCORD_GUILD_ID is missing. The bot is restricted to a single server.');
   process.exit(1);
 }
-if (!DASHSCOPE_API_KEY) {
-  console.error('DASHSCOPE_API_KEY is missing. Fill it in .env');
+if (!ARK_API_KEY) {
+  console.error('ARK_API_KEY is missing. Fill it in .env (required for /sd2).');
   process.exit(1);
 }
 
-const wan = new WanClient();
 const flux = new FluxClient();
 const sd2 = new Sd2Client();
 const jobStore = createJobStore({ dir: process.env.GEN_JOB_STORE_DIR || './.jobs' });
@@ -147,7 +133,7 @@ client.once('clientReady', async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   console.log(`Server: ${DISCORD_GUILD_ID} (locked)`);
   console.log(`Limit:  ${MAX_PER_USER} concurrent per user (cleared on restart)`);
-  c.user.setActivity('/wan-3 • /flux-3 • /sd2', { type: ActivityType.Listening });
+  c.user.setActivity('/flux-3 • /sd2', { type: ActivityType.Listening });
   resumePendingJobs().catch((err) => console.error('Resume sweep failed:', err));
 });
 
@@ -188,7 +174,7 @@ function makeAnchorFns({ interaction = null, channel = null } = {}) {
   return { finalise, replyToAnchor, setAnchor };
 }
 
-// Collect reference attachments and return their public URLs. WAN3 fetches these
+// Collect reference attachments and return their public URLs. The provider fetches
 // directly (input.media), so there is no upload step.
 function collectReferences(interaction, imageNames, maxImages, videoNames, maxVideos) {
   const imageAtts = imageNames.map((n) => interaction.options.getAttachment(n)).filter(Boolean);
@@ -223,7 +209,7 @@ function collectReferences(interaction, imageNames, maxImages, videoNames, maxVi
 async function handleGenerationError(err, { finalise, replyToAnchor, prompt, user, idRef, commandName = 'Generation', idLabel = 'ID' }) {
   const idVal = idRef?.value;
 
-  // Timeout gets its own clean message (works for WanError and FluxError).
+  // Timeout gets its own clean message (works for Sd2Error and FluxError).
   if (err?.timedOut) {
     const minutes = Math.max(1, Math.round(VIDEO_TIMEOUT / 60_000));
     const card = new EmbedBuilder()
@@ -277,185 +263,8 @@ async function handleGenerationError(err, { finalise, replyToAnchor, prompt, use
   console.log(`${idVal ?? 'no-task'} ${blocked ? 'blocked' : 'failed'}: ${message}`);
 }
 
-const settingsLine = (duration, ratio, resolution, extra = []) =>
-  [`\`${duration}s\``, `\`${ratio}\``, `\`${resolution}\``, '`audio on`', ...extra].join(' \u2022 ');
-
-// ─── /wan-3 generation handler ───────────────────────────────────────────────
-
-async function runGeneration(interaction) {
-  const commandName = 'WAN 3.0';
-
-  if (interaction.guildId !== DISCORD_GUILD_ID) {
-    await interaction.reply({ content: 'This bot only works in its home server.', flags: MessageFlags.Ephemeral });
-    return;
-  }
-
-  const user = interaction.user;
-  const jobId = takeSlot(user.id);
-  if (!jobId) {
-    await interaction.reply({
-      content: `You already have ${runningCount(user.id)} of ${MAX_PER_USER} generations running \u2014 wait for one to finish.`,
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
-
-  const taskIdRef = { value: null };
-  const startedAt = Date.now();
-  const { finalise, replyToAnchor, setAnchor } = makeAnchorFns({ interaction });
-
-  try {
-    const prompt = interaction.options.getString('prompt', true);
-    const duration = interaction.options.getInteger('duration') ?? WAN_DEFAULT_DURATION;
-    const ratio = interaction.options.getString('ratio') ?? WAN_DEFAULT_RATIO;
-    const resolution = interaction.options.getString('resolution') ?? WAN_DEFAULT_RESOLUTION;
-
-    const { images: imgAtts, videos: vidAtts, references, error: refError } = collectReferences(
-      interaction, ['img1', 'img2', 'img3', 'img4'], WAN_MAX_IMAGES, ['vid1'], WAN_MAX_VIDEOS,
-    );
-    if (refError) {
-      await interaction.reply({ content: refError, flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const refCount = (imgAtts?.length ?? 0) + (vidAtts?.length ?? 0);
-
-    await interaction.deferReply();
-
-    const preparing = new EmbedBuilder()
-      .setColor(COLOR_WORKING)
-      .setAuthor({ name: commandName })
-      .setTitle('Preparing your request')
-      .setDescription(`>>> ${truncate(prompt, 900)}`)
-      .addFields({ name: 'Settings', value: settingsLine(duration, ratio, resolution) })
-      .setFooter({ text: `Requested by ${user.username} \u2022 submitting\u2026`, iconURL: user.displayAvatarURL() })
-      .setTimestamp();
-    if (refCount) {
-      const refSummary = [
-        imgAtts.length ? `${imgAtts.length} image${imgAtts.length > 1 ? 's' : ''}` : null,
-        vidAtts.length ? `${vidAtts.length} video${vidAtts.length > 1 ? 's' : ''}` : null,
-      ].filter(Boolean).join(', ');
-      preparing.addFields({ name: 'References', value: refSummary });
-      if (imgAtts.length) preparing.setThumbnail(imgAtts[0].url);
-    }
-
-    const anchor = await interaction.editReply({ embeds: [preparing] });
-    setAnchor(anchor);
-
-    // Submit the task.
-    const { taskId } = await wan.createTask({ prompt, duration, ratio, resolution, references });
-    taskIdRef.value = taskId;
-
-    // Persist immediately so a crash/kill mid-render can resume it.
-    try {
-      await jobStore.save({
-        jobId,
-        userId: user.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-        anchorMessageId: anchor.id,
-        prompt,
-        duration,
-        ratio,
-        resolution,
-        refCount,
-        taskId,
-        deadlineAt: startedAt + VIDEO_TIMEOUT,
-        createdAt: startedAt,
-      });
-    } catch (err) {
-      console.warn(`Could not persist job ${jobId}: ${err?.message ?? err}`);
-    }
-
-    const working = new EmbedBuilder()
-      .setColor(COLOR_WORKING)
-      .setAuthor({ name: commandName })
-      .setTitle('Generating your video')
-      .setDescription(`>>> ${truncate(prompt, 900)}`)
-      .addFields({ name: 'Settings', value: settingsLine(duration, ratio, resolution) })
-      .setFooter({ text: `Requested by ${user.username} \u2022 this takes a few minutes`, iconURL: user.displayAvatarURL() })
-      .setTimestamp();
-    if (refCount) {
-      const refSummary = [
-        imgAtts.length ? `${imgAtts.length} image${imgAtts.length > 1 ? 's' : ''}` : null,
-        vidAtts.length ? `${vidAtts.length} video${vidAtts.length > 1 ? 's' : ''}` : null,
-      ].filter(Boolean).join(', ');
-      working.addFields({ name: 'References', value: refSummary });
-      if (imgAtts.length) working.setThumbnail(imgAtts[0].url);
-    }
-    await finalise(working);
-
-    // Poll to completion against the 20-minute budget.
-    const { videoUrl } = await wan.waitForTask(taskId, {
-      intervalMs: POLL_MS,
-      timeoutMs: VIDEO_TIMEOUT,
-      onUpdate: (out) => { if (out?.task_id) taskIdRef.value = out.task_id; },
-    });
-
-    // Download (streamed to a temp file, never held whole in memory).
-    const file = await wan.downloadFile(videoUrl);
-    try {
-      const limit = uploadLimitBytes(interaction.guild);
-      const mb = (file.bytes / MB).toFixed(1);
-
-      const done = new EmbedBuilder()
-        .setColor(COLOR_DONE)
-        .setAuthor({ name: commandName })
-        .setTitle('Your video is ready')
-        .setDescription(`>>> ${truncate(prompt, 900)}`)
-        .addFields(
-          { name: 'Settings', value: settingsLine(duration, ratio, resolution, [`\`${fmtElapsed(Date.now() - startedAt)}\``]) },
-          { name: 'Task ID', value: `\`\`\`${taskIdRef.value ?? ''}\`\`\`` },
-        )
-        .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
-        .setTimestamp();
-      if (refCount) {
-        const refSummary = [
-          imgAtts.length ? `${imgAtts.length} image${imgAtts.length > 1 ? 's' : ''}` : null,
-          vidAtts.length ? `${vidAtts.length} video${vidAtts.length > 1 ? 's' : ''}` : null,
-        ].filter(Boolean).join(', ');
-        done.addFields({ name: 'References', value: refSummary });
-      }
-      await finalise(done);
-
-      if (file.bytes >= limit) {
-        await replyToAnchor({
-          content: `${user}\nYour video rendered but it's ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.`,
-        });
-        console.log(`${taskIdRef.value} succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, over limit)`);
-      } else {
-        await replyToAnchor({
-          content: `${user}`,
-          files: [new AttachmentBuilder(createReadStream(file.path), { name: 'wan3-video.mp4' })],
-        });
-        console.log(`${taskIdRef.value} succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, attached)`);
-      }
-    } finally {
-      await safeUnlink(file.path);
-    }
-  } catch (err) {
-    try {
-      await handleGenerationError(err, {
-        finalise, replyToAnchor,
-        prompt: interaction.options.getString('prompt') ?? '',
-        user, idRef: taskIdRef, commandName: 'WAN 3.0', idLabel: 'Task ID',
-      });
-    } catch (fatal) {
-      console.error(`Unhandled error in ${commandName} for ${user.tag}:`, fatal);
-      try {
-        const body = { content: 'Something went wrong starting that generation.' };
-        if (interaction.deferred || interaction.replied) await interaction.editReply(body);
-        else await interaction.reply({ ...body, flags: MessageFlags.Ephemeral });
-      } catch { /* interaction unusable */ }
-    }
-  } finally {
-    releaseSlot(user.id, jobId);
-    await jobStore.remove(jobId);
-  }
-}
-
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName === 'wan-3') return runGeneration(interaction);
   if (interaction.commandName === 'flux-3') return runFluxGeneration(interaction);
   if (interaction.commandName === 'sd2') return runSd2Generation(interaction);
 });
@@ -657,21 +466,31 @@ async function runFluxGeneration(interaction) {
     const anchor = await interaction.editReply({ embeds: [preparing] });
     setAnchor(anchor);
 
-    // Disposable account + workspace + freemium credits.
-    const session = await flux.createSession();
+    // Disposable account + workspace + freemium credits. Retry once — signup can
+    // transiently fail (temp email allocation / verification code hiccups).
+    let session = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try { session = await flux.createSession(); break; }
+      catch (err) {
+        if (attempt === 2) throw err;
+        console.warn(`flux createSession attempt ${attempt} failed (${err?.message ?? err}); retrying`);
+      }
+    }
 
-    const working = new EmbedBuilder()
+    // Submit the generation. A content-policy rejection (violence, copyright, etc.)
+    // surfaces here as a clean "Couldn't generate your video" message.
+    const assetId = await flux.generate(session, { prompt, duration, ratio });
+    idRef.value = assetId;
+
+    // The generation id now exists — flip the card to "Generating your video".
+    await finalise(new EmbedBuilder()
       .setColor(COLOR_WORKING)
       .setAuthor({ name: commandName })
       .setTitle('Generating your video')
       .setDescription(`>>> ${truncate(prompt, 900)}`)
       .addFields({ name: 'Settings', value: fluxSettings(duration, ratio) })
       .setFooter({ text: `Requested by ${user.username} \u2022 this takes a few minutes`, iconURL: user.displayAvatarURL() })
-      .setTimestamp();
-    await finalise(working);
-
-    const assetId = await flux.generate(session, { prompt, duration, ratio });
-    idRef.value = assetId;
+      .setTimestamp());
 
     // Persist so a crash/kill mid-render can resume (rebuild the session from the
     // refresh token, then keep polling the same asset).
@@ -787,85 +606,15 @@ async function resumeOne(rec) {
 
   const user = await client.users.fetch(rec.userId).catch(() => null);
   const prompt = rec.prompt ?? '';
-  const taskIdRef = { value: rec.taskId };
   const { finalise, replyToAnchor, setAnchor } = makeAnchorFns({ channel });
   setAnchor(anchor);
 
-  if (rec.kind === 'flux') {
-    await resumeFlux(rec, { user, prompt, channel, finalise, replyToAnchor });
-    return;
-  }
+  if (rec.kind === 'flux') return resumeFlux(rec, { user, prompt, channel, finalise, replyToAnchor });
+  if (rec.kind === 'sd2') return resumeSd2(rec, { user, prompt, channel, finalise, replyToAnchor });
 
-  if (rec.kind === 'sd2') {
-    await resumeSd2(rec, { user, prompt, channel, finalise, replyToAnchor });
-    return;
-  }
-
-  try {
-    const remaining = (rec.deadlineAt ?? 0) - Date.now();
-    if (remaining <= 0) {
-      await handleGenerationError(
-        new WanError(`Generation timed out after ${Math.max(1, Math.round(VIDEO_TIMEOUT / 60_000))} minutes.`, { timedOut: true }),
-        { finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId), idRef: taskIdRef, commandName: 'WAN 3.0', idLabel: 'Task ID' },
-      );
-      return;
-    }
-
-    try {
-      await finalise(new EmbedBuilder()
-        .setColor(COLOR_WORKING)
-        .setAuthor({ name: 'WAN 3.0' })
-        .setTitle('Resuming your video')
-        .setDescription(`>>> ${truncate(prompt, 900)}`)
-        .addFields({ name: 'Status', value: 'Picked this back up after a restart \u2014 still working on it.' })
-        .setFooter({ text: user ? `Requested by ${user.username}` : 'Recovered after a restart', iconURL: user?.displayAvatarURL?.() })
-        .setTimestamp());
-    } catch { /* cosmetic */ }
-
-    const { videoUrl } = await wan.waitForTask(rec.taskId, {
-      intervalMs: POLL_MS,
-      timeoutMs: remaining,
-      onUpdate: (out) => { if (out?.task_id) taskIdRef.value = out.task_id; },
-    });
-
-    const file = await wan.downloadFile(videoUrl);
-    try {
-      const limit = uploadLimitBytes(channel.guild ?? null);
-      const mb = (file.bytes / MB).toFixed(1);
-      const mention = user ? `${user}` : `<@${rec.userId}>`;
-
-      const done = new EmbedBuilder()
-        .setColor(COLOR_DONE)
-        .setAuthor({ name: 'WAN 3.0' })
-        .setTitle('Your video is ready')
-        .setDescription(`>>> ${truncate(prompt, 900)}`)
-        .addFields(
-          { name: 'Settings', value: settingsLine(rec.duration, rec.ratio, rec.resolution, ['`recovered`']) },
-          { name: 'Task ID', value: `\`\`\`${taskIdRef.value ?? ''}\`\`\`` },
-        )
-        .setFooter({ text: user ? `Requested by ${user.username}` : 'Recovered after a restart', iconURL: user?.displayAvatarURL?.() })
-        .setTimestamp();
-      await finalise(done);
-
-      if (file.bytes >= limit) {
-        await replyToAnchor({ content: `${mention}\nYour video rendered but it's ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
-        console.log(`${taskIdRef.value} (resumed) succeeded (${mb} MB, over limit)`);
-      } else {
-        await replyToAnchor({ content: `${mention}`, files: [new AttachmentBuilder(createReadStream(file.path), { name: 'wan3-video.mp4' })] });
-        console.log(`${taskIdRef.value} (resumed) succeeded (${mb} MB, attached)`);
-      }
-    } finally {
-      await safeUnlink(file.path);
-    }
-  } catch (err) {
-    try {
-      await handleGenerationError(err, { finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId), idRef: taskIdRef, commandName: 'WAN 3.0', idLabel: 'Task ID' });
-    } catch (fatal) {
-      console.error(`Resume ${rec.jobId} delivery failed:`, fatal);
-    }
-  } finally {
-    await jobStore.remove(rec.jobId);
-  }
+  // Unknown / removed provider (e.g. old /wan-3 jobs) — cannot resume; drop it.
+  console.warn(`Resume ${rec.jobId}: unsupported kind '${rec.kind ?? 'legacy'}', dropping.`);
+  await jobStore.remove(rec.jobId);
 }
 
 async function resumeFlux(rec, { user, prompt, channel, finalise, replyToAnchor }) {

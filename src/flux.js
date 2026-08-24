@@ -43,7 +43,7 @@ export const DEFAULT_POLL_INTERVAL_MS = 8_000;
 export const DEFAULT_VIDEO_TIMEOUT_MS = 1_200_000; // 20 min
 const REQUEST_TIMEOUT_MS = 45_000;
 const MAX_CONSECUTIVE_POLL_FAILURES = 6;
-const BLOCK_RE = /moderat|policy|violat|inappropriate|sensitive|nsfw|prohibit|safety|blocked/i;
+const BLOCK_RE = /moderat|policy|violat|violence|violent|gore|graphic|inappropriate|sensitive|nsfw|explicit|prohibit|safety|blocked|abuse/i;
 
 // ─── Error ───────────────────────────────────────────────────────────────────
 export class FluxError extends Error {
@@ -258,13 +258,12 @@ export class FluxClient {
     const txt = await resp.text().catch(() => '');
     if (!resp.ok) {
       console.error(`[flux.generate] HTTP ${resp.status}: ${txt.slice(0, 500)}`);
-      // Never surface the raw provider message to users — it can name/leak the
-      // backend. Detect a content block from it, but show a generic message.
-      let blocked = false;
-      try { blocked = BLOCK_RE.test(txt); } catch { /* */ }
+      // HTTP 422 is a content-policy rejection at submit (e.g. violence, copyright).
+      // Never surface the raw provider text — just a clean generic message.
+      const blocked = resp.status === 422 || BLOCK_RE.test(txt);
       const msg = blocked
-        ? 'This prompt was blocked by the content filter. Try a different prompt.'
-        : 'Could not start video generation. Please try again.';
+        ? "Couldn't generate your video. Try a different prompt."
+        : "Couldn't generate your video. Please try again.";
       throw new FluxError(msg, { code: String(resp.status), body: txt, blocked });
     }
     let data; try { data = JSON.parse(txt); } catch { data = null; }
@@ -315,10 +314,10 @@ export class FluxClient {
           return { videoUrl: url, raw: asset };
         }
         if (status === 'rejected' || status === 'moderation_rejected' || status === 'blocked') {
-          throw new FluxError('This prompt was rejected by the content filter \u2014 it may involve copyrighted, explicit, or otherwise restricted content. Try a different prompt.', { code: status, body: asset, blocked: true });
+          throw new FluxError("Couldn't generate your video. Try a different prompt.", { code: status, body: asset, blocked: true });
         }
         if (['failed', 'error', 'errored', 'cancelled', 'canceled'].includes(status)) {
-          throw new FluxError('Generation failed. Please try again.', { code: status, body: asset, blocked: BLOCK_RE.test(JSON.stringify(asset)) });
+          throw new FluxError("Couldn't generate your video. Please try again.", { code: status, body: asset, blocked: BLOCK_RE.test(JSON.stringify(asset)) });
         }
       }
       await sleep(intervalMs);

@@ -1,7 +1,7 @@
 {
   "name": "yopisora-bot",
   "version": "6.0.0",
-  "description": "Discord bot for WAN 3.0, FLUX 3 and Seedance 2.0 video generation",
+  "description": "Discord bot for FLUX 3 and Seedance 2.0 video generation",
   "main": "src/bot.js",
   "scripts": {
     "test": "node --test test/*.test.mjs",
