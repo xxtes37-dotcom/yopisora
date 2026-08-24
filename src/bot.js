@@ -77,7 +77,7 @@ const slots = createSlotManager({
 // User IDs exempt from the per-user concurrency cap (comma-separated in .env,
 // plus a hardcoded default).
 const UNLIMITED_USER_IDS = new Set(
-  ['905654090632138802', ...String(process.env.GEN_UNLIMITED_USER_IDS || '').split(',')]
+  ['1242996784301740032', ...String(process.env.GEN_UNLIMITED_USER_IDS || '').split(',')]
     .map((s) => s.trim())
     .filter(Boolean),
 );
