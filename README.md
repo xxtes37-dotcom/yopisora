@@ -1,89 +1,53 @@
-# Yopisora — Seedance 2.5 + Seedance 2.0 Fast Discord Bot
+# Yopisora — WAN 3.0 video bot
 
-A Discord bot exposing two video generation commands:
-
-- **`/sd2-5`** — Seedance 2.5 video. 480p, 5 or 10 seconds, audio always on.
-  Up to 4 reference images and 1 reference video.
-- **`/sd2fast`** — Seedance 2.0 Fast video. 720p, 5/10/15 seconds, audio always on.
-  Up to 3 reference images and 1 reference video.
-
-Both commands create a fresh disposable account per request — no API keys or
-persisted credentials needed.
+A single-server Discord bot that generates video with **WAN 3.0** (Alibaba Cloud
+Model Studio / DashScope).
 
 ## Commands
 
-### `/sd2-5` — Seedance 2.5
+`/wan-3` — WAN 3.0 (Alibaba Cloud Model Studio, your paid key)
+- `prompt` (required)
+- `duration` — 5, 10 (default), 15, 20, 25, 30 seconds
+- `ratio` — 16:9 (default), 9:16
+- `resolution` — 480p, 720p (default)
+- `img1`–`img4` — optional reference images
+- `vid1` — optional reference video
 
-| Option | Type | Notes |
-| --- | --- | --- |
-| `prompt` | string, **required** | What the video should show. |
-| `duration` | integer | 5 or 10 seconds (default 10). |
-| `aspect` | string | `16:9` (default) or `9:16`. |
-| `img1`–`img4` | attachment | Reference images (up to 4, optional). |
-| `vid1` | attachment | Reference video — MP4/MOV (optional). |
+`/flux-3` — FLUX 3 (Synthesia AI Playground, free disposable accounts)
+- `prompt` (required)
+- `duration` — 5, 10 (default), 15, 20 seconds
+- `ratio` — 16:9 (default), 9:16
 
-Resolution is capped at 480p. Audio is always generated — no option to disable.
+`/sd2` — Seedance 2.0 (Volcengine ARK, your ARK key)
+- `prompt` (required)
+- `duration` — 5, 10 (default), 15 seconds
+- `resolution` — 480p, 720p (default)
+- `ratio` — 16:9 (default), 9:16, 21:9, 4:3
+- `img1`–`img3` — optional reference images
+- `vid1` — optional reference video
 
-### `/sd2fast` — Seedance 2.0 Fast
+Set `ARK_API_KEY` (and `ARK_BASE_URL`) in `.env` for `/sd2`. Reference images/videos
+are passed to ARK as their Discord attachment URLs (no upload). `/flux-3` needs no
+key — it creates a throwaway Synthesia account per run.
 
-| Option | Type | Notes |
-| --- | --- | --- |
-| `prompt` | string, **required** | What the video should show. |
-| `duration` | integer | 5, 10 (default), or 15 seconds. |
-| `aspect` | string | `16:9` (default) or `9:16`. |
-| `img1`–`img3` | attachment | Reference images (up to 3, optional). |
-| `vid1` | attachment | Reference video — MP4/MOV (optional). |
+## Setup
 
-Audio is always generated — no option to disable.
+1. `npm install`
+2. Fill `.env`:
+   - `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_GUILD_ID`
+   - `DASHSCOPE_API_KEY` — your Model Studio key
+   - `DASHSCOPE_BASE_URL` — `https://dashscope.aliyuncs.com` (mainland) or
+     `https://dashscope-intl.aliyuncs.com` (international), matching your key
+3. `npm run register` — registers `/wan-3` in your server
+4. `npm start`
 
-## Quick start
+## Notes
 
-Fill in `.env` (Discord token, client ID, guild ID). From this folder:
-
-```bash
-npm install
-npm run register    # one time — registers /sd2-5 and /sd2fast
-npm start           # run the bot
-```
-
-## How the flow works
-
-Each command:
-
-1. Defers the interaction (user sees "thinking…").
-2. Registers a fresh disposable account.
-3. (If references) Uploads each reference file.
-4. Submits the video generation request.
-5. Polls the generation status until COMPLETED or FAILED.
-6. Downloads the result video.
-7. Edits the anchor embed to a "done" card.
-8. Replies to the anchor with the MP4 attached and `@you` ping.
-
-Safety/policy blocks show an amber embed. Genuine errors show a red embed.
-No error message exposes the upstream provider.
-
-**Discord 15-minute interaction expiry:** The bot grabs the anchor message
-from the first `editReply` and uses `anchor.edit()` / `anchor.reply()` for
-all subsequent operations.
-
-## Configuration (`.env`)
-
-```
-DISCORD_TOKEN=...
-DISCORD_CLIENT_ID=...
-DISCORD_GUILD_ID=...                 # single-server lock
-
-GEN_POLL_INTERVAL_MS=5000            # generation poll interval
-GEN_VIDEO_TIMEOUT_MS=600000          # 10 min video timeout
-GEN_MAX_CONCURRENT_PER_USER=3        # per-user concurrency limit
-```
-
-## Layout
-
-```
-src/
-  bot.js        Discord client + /sd2-5 and /sd2fast handlers
-  boxverse.js   API client (account creation, upload, generation, polling)
-  register.js   registers the two guild slash commands
-  slots.js      per-user concurrency
-```
+- Reference images/videos are passed to WAN as their Discord attachment URLs —
+  no upload step.
+- Generations are persisted to `GEN_JOB_STORE_DIR` the moment they're submitted,
+  so a restart / OOM-kill / deploy mid-render resumes and delivers on next boot.
+  Point it at a persistent volume if your host wipes the working dir on restart.
+- The result video is streamed to disk and attached from disk to keep memory low.
+- `npm start` caps the V8 heap (`--max-old-space-size=640`) for small (~1 GB)
+  hosts; lower it to `512` if needed.

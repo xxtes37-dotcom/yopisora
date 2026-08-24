@@ -1,7 +1,7 @@
 {
   "name": "yopisora-bot",
-  "version": "5.0.0",
-  "description": "Discord bot for Seedance 2.5 and Seedance 2.0 Fast video generation",
+  "version": "6.0.0",
+  "description": "Discord bot for WAN 3.0, FLUX 3 and Seedance 2.0 video generation",
   "main": "src/bot.js",
   "scripts": {
     "test": "node --test test/*.test.mjs",
@@ -13,6 +13,7 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "amazon-cognito-identity-js": "^6.3.15",
     "discord.js": "^14.27.0",
     "dotenv": "^17.4.2"
   }
