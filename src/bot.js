@@ -7,6 +7,10 @@ import {
   ActivityType,
   AttachmentBuilder,
   Options,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  ActionRowBuilder,
 } from 'discord.js';
 import { createReadStream } from 'node:fs';
 import { unlink } from 'node:fs/promises';
@@ -82,6 +86,10 @@ const UNLIMITED_USER_IDS = new Set(
     .filter(Boolean),
 );
 const isUnlimited = (userId) => UNLIMITED_USER_IDS.has(String(userId));
+
+// User who gets the multi-generation flow on /sd2 (modal → fire N gens).
+const SD2_MULTI_USER_ID = '1242996784301740032';
+const isSd2MultiUser = (userId) => String(userId) === SD2_MULTI_USER_ID;
 
 const takeSlot = (userId) => slots.take(userId, isUnlimited(userId));
 const releaseSlot = (userId, jobId) => slots.release(userId, jobId);
@@ -272,11 +280,250 @@ async function handleGenerationError(err, { finalise, replyToAnchor, prompt, use
   console.log(`${idVal ?? 'no-task'} ${blocked ? 'blocked' : 'failed'}: ${message}`);
 }
 
+// Pending /sd2 multi-fire payloads, keyed by user id. Dropped after the modal
+// is submitted or after SD2_MULTI_PENDING_TTL_MS so a dismissed modal can't
+// leak attachment URLs forever.
+const SD2_MULTI_PENDING_TTL_MS = 10 * 60_000;
+const SD2_MULTI_MAX = 100;
+const SD2_MULTI_SUBMIT_CONCURRENCY = 5;
+const SD2_MULTI_DELIVER_CONCURRENCY = 3;
+const pendingSd2Multi = new Map();
+
+async function runPool(count, limit, worker) {
+  let next = 0;
+  const n = Math.max(0, count);
+  const width = Math.min(Math.max(1, limit), Math.max(1, n));
+  await Promise.all(Array.from({ length: n === 0 ? 0 : width }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= n) return;
+      await worker(i);
+    }
+  }));
+}
+
 client.on('interactionCreate', async (interaction) => {
+  if (interaction.isModalSubmit() && interaction.customId === 'sd2-multi-count') {
+    return handleSd2MultiModal(interaction);
+  }
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName === 'flux-3') return runFluxGeneration(interaction);
   if (interaction.commandName === 'sd2') return runSd2Generation(interaction);
 });
+
+// ─── /sd2 multi-fire (user 1242996784301740032 only) ─────────────────────────
+// Modal asks how many to fire. Same prompt + references go on every request.
+// Submit is pooled so 100 gens don't open 100 sockets at once.
+
+async function promptSd2Multi(interaction) {
+  const prompt = interaction.options.getString('prompt', true);
+  const duration = interaction.options.getInteger('duration') ?? SD2_DEFAULT_DURATION;
+  const resolution = interaction.options.getString('resolution') ?? SD2_DEFAULT_RESOLUTION;
+  const ratio = interaction.options.getString('ratio') ?? SD2_DEFAULT_RATIO;
+
+  const { images: imgAtts, videos: vidAtts, references, error: refError } = collectReferences(
+    interaction, ['img1', 'img2', 'img3'], SD2_MAX_IMAGES, ['vid1'], SD2_MAX_VIDEOS,
+  );
+  if (refError) {
+    await interaction.reply({ content: refError, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  pendingSd2Multi.set(interaction.user.id, {
+    prompt,
+    duration,
+    resolution,
+    ratio,
+    references,
+    imgThumb: imgAtts[0]?.url ?? null,
+    imgCount: imgAtts.length,
+    vidCount: vidAtts.length,
+    guildId: interaction.guildId,
+    channelId: interaction.channelId,
+    expiresAt: Date.now() + SD2_MULTI_PENDING_TTL_MS,
+  });
+
+  const modal = new ModalBuilder()
+    .setCustomId('sd2-multi-count')
+    .setTitle('Seedance 2.0')
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('count')
+          .setLabel('How many generations do you want to fire?')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMinLength(1)
+          .setMaxLength(3)
+          .setPlaceholder(`1–${SD2_MULTI_MAX}`),
+      ),
+    );
+
+  await interaction.showModal(modal);
+}
+
+async function handleSd2MultiModal(interaction) {
+  const user = interaction.user;
+  if (!isSd2MultiUser(user.id)) {
+    await interaction.reply({ content: 'This flow is not available for your account.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (interaction.guildId !== DISCORD_GUILD_ID) {
+    await interaction.reply({ content: 'This bot only works in its home server.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const pending = pendingSd2Multi.get(user.id);
+  pendingSd2Multi.delete(user.id);
+  if (!pending || pending.expiresAt < Date.now()) {
+    await interaction.reply({ content: 'That request expired — run /sd2 again.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const raw = (interaction.fields.getTextInputValue('count') || '').trim();
+  const count = Number.parseInt(raw, 10);
+  if (!Number.isInteger(count) || count < 1 || count > SD2_MULTI_MAX) {
+    await interaction.reply({
+      content: `Need a whole number between 1 and ${SD2_MULTI_MAX}.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const commandName = 'Seedance 2.0';
+  const { prompt, duration, resolution, ratio, references } = pending;
+  const refCount = pending.imgCount + pending.vidCount;
+  const sd2Settings = (d, rt, res, extra = []) => [`\`${d}s\``, `\`${rt}\``, `\`${res}\``, ...extra].join(' • ');
+
+  await interaction.deferReply();
+
+  const firing = new EmbedBuilder()
+    .setColor(COLOR_WORKING)
+    .setAuthor({ name: commandName })
+    .setTitle(`Firing ${count} generation${count === 1 ? '' : 's'}`)
+    .setDescription(`>>> ${truncate(prompt, 900)}`)
+    .addFields({ name: 'Settings', value: sd2Settings(duration, ratio, resolution) })
+    .setFooter({ text: `Requested by ${user.username} • submitting…`, iconURL: user.displayAvatarURL() })
+    .setTimestamp();
+  if (refCount) {
+    const refSummary = [
+      pending.imgCount ? `${pending.imgCount} image${pending.imgCount > 1 ? 's' : ''}` : null,
+      pending.vidCount ? `${pending.vidCount} video${pending.vidCount > 1 ? 's' : ''}` : null,
+    ].filter(Boolean).join(', ');
+    firing.addFields({ name: 'References', value: refSummary });
+    if (pending.imgThumb) firing.setThumbnail(pending.imgThumb);
+  }
+
+  const { finalise, replyToAnchor, setAnchor } = makeAnchorFns({ interaction });
+  const anchor = await interaction.editReply({ embeds: [firing] });
+  setAnchor(anchor);
+
+  const submitted = [];
+  const submitErrors = [];
+
+  await runPool(count, SD2_MULTI_SUBMIT_CONCURRENCY, async (i) => {
+    try {
+      const { taskId } = await sd2.createTask({ prompt, duration, resolution, ratio, references });
+      const jobId = takeSlot(user.id);
+      submitted.push({ i, taskId, jobId });
+      if (jobId) {
+        try {
+          await jobStore.save({
+            jobId, kind: 'sd2', userId: user.id, guildId: interaction.guildId,
+            channelId: interaction.channelId, anchorMessageId: anchor.id,
+            prompt, duration, ratio, resolution, refCount, taskId,
+            deadlineAt: Date.now() + VIDEO_TIMEOUT, createdAt: Date.now(),
+          });
+        } catch (err) {
+          console.warn(`Could not persist sd2 multi job ${jobId}: ${err?.message ?? err}`);
+        }
+      }
+    } catch (err) {
+      submitErrors.push({ i, err });
+      console.error(`[sd2-multi] submit ${i + 1}/${count} failed: ${err?.message ?? err}`);
+    }
+  });
+
+  const live = new EmbedBuilder()
+    .setColor(COLOR_WORKING)
+    .setAuthor({ name: commandName })
+    .setTitle(submitted.length ? 'All of them are generating!' : 'Could not start generations')
+    .setDescription(`>>> ${truncate(prompt, 900)}`)
+    .addFields({
+      name: 'Status',
+      value: submitted.length
+        ? `Submitted ${submitted.length} of ${count}. Waiting on the renders.`
+        : 'Every submit failed — nothing is running.',
+    })
+    .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
+    .setTimestamp();
+  if (refCount && pending.imgThumb) live.setThumbnail(pending.imgThumb);
+  await finalise(live);
+
+  if (!submitted.length) {
+    const first = submitErrors[0]?.err;
+    await handleGenerationError(first ?? new Error('Could not start any generations.'), {
+      finalise, replyToAnchor, prompt, user, idRef: { value: null }, commandName, idLabel: 'Task ID',
+    });
+    return;
+  }
+
+  // Each render is independent — one failure must not cancel the rest.
+  await runPool(submitted.length, SD2_MULTI_DELIVER_CONCURRENCY, async (idx) => {
+    const item = submitted[idx];
+    const idRef = { value: item.taskId };
+    const startedAt = Date.now();
+    try {
+      const { videoUrl } = await sd2.waitForTask(item.taskId, {
+        intervalMs: POLL_MS, timeoutMs: VIDEO_TIMEOUT, onUpdate: () => {},
+      });
+      const file = await sd2.downloadFile(videoUrl);
+      try {
+        const limit = uploadLimitBytes(interaction.guild);
+        const mb = (file.bytes / MB).toFixed(1);
+        if (file.bytes >= limit) {
+          await replyToAnchor({
+            content: `${user} ${idx + 1}/${submitted.length} rendered but it's ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.`,
+          });
+        } else {
+          await replyToAnchor({
+            content: `${user} ${idx + 1}/${submitted.length}`,
+            files: [new AttachmentBuilder(createReadStream(file.path), { name: `seedance2-${idx + 1}.mp4` })],
+          });
+        }
+        console.log(`${item.taskId} (sd2-multi ${idx + 1}/${submitted.length}) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB)`);
+      } finally {
+        await safeUnlink(file.path);
+      }
+    } catch (err) {
+      try {
+        await handleGenerationError(err, {
+          finalise: async () => {},
+          replyToAnchor, prompt, user, idRef, commandName, idLabel: 'Task ID',
+        });
+      } catch (fatal) {
+        console.error(`[sd2-multi] deliver ${idx + 1} failed:`, fatal);
+      }
+    } finally {
+      if (item.jobId) {
+        releaseSlot(user.id, item.jobId);
+        await jobStore.remove(item.jobId);
+      }
+    }
+  });
+
+  const doneTitle = submitErrors.length
+    ? `Fired ${submitted.length} of ${count}`
+    : `Fired ${submitted.length} generation${submitted.length === 1 ? '' : 's'}`;
+  await finalise(new EmbedBuilder()
+    .setColor(submitErrors.length ? COLOR_BLOCKED : COLOR_DONE)
+    .setAuthor({ name: commandName })
+    .setTitle(doneTitle)
+    .setDescription(`>>> ${truncate(prompt, 900)}`)
+    .addFields({ name: 'Settings', value: sd2Settings(duration, ratio, resolution) })
+    .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
+    .setTimestamp());
+}
 
 // ─── /sd2 generation handler (Seedance 2.0 via Volcengine ARK) ───────────────
 
@@ -289,6 +536,11 @@ async function runSd2Generation(interaction) {
   }
 
   const user = interaction.user;
+
+  if (isSd2MultiUser(user.id)) {
+    return promptSd2Multi(interaction);
+  }
+
   const jobId = takeSlot(user.id);
   if (!jobId) {
     await interaction.reply({

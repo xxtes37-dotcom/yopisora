@@ -1,6 +1,6 @@
 {
   "name": "yopisora-bot",
-  "version": "6.0.0",
+  "version": "6.5.0",
   "description": "Discord bot for FLUX 3 and Seedance 2.0 video generation",
   "main": "src/bot.js",
   "scripts": {
