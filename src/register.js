@@ -80,11 +80,24 @@ const sd2Builder = new SlashCommandBuilder()
   .addAttachmentOption((o) => o.setName('img3').setDescription('A third reference image (optional)'))
   .addAttachmentOption((o) => o.setName('vid1').setDescription(`Reference video \u2014 MP4/MOV (optional, up to ${SD2_MAX_VIDEOS})`));
 
+/**
+ * /autobypass \u2014 fires 10 Seedance 2.0 renders with the intro clip as the
+ * reference video, waits for all of them, then judges with ffmpeg which render
+ * has the least intro and delivers that one trimmed to the scene.
+ * 15s \u2022 16:9 \u2022 720p, no user references.
+ */
+const autobypassBuilder = new SlashCommandBuilder()
+  .setName('autobypass')
+  .setDescription('Fire 10 renders of your prompt and deliver the cleanest one, intro trimmed')
+  .addStringOption((o) =>
+    o.setName('prompt').setDescription('The scene the video should cut to after the intro').setRequired(true).setMaxLength(3000),
+  );
+
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 const route = Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID);
 
 try {
-  const data = await rest.put(route, { body: [flux3Builder.toJSON(), sd2Builder.toJSON()] });
+  const data = await rest.put(route, { body: [flux3Builder.toJSON(), sd2Builder.toJSON(), autobypassBuilder.toJSON()] });
   console.log(`Registered ${data.length} command(s) in server ${DISCORD_GUILD_ID}:`);
   for (const c of data) {
     console.log(`  /${c.name} \u2014 ${c.description}`);

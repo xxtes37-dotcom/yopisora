@@ -1,16 +1,15 @@
-# Yopisora — WAN 3.0 video bot
+# Yopisora — video bot
 
-A single-server Discord bot that generates video with **WAN 3.0** (Alibaba Cloud
-Model Studio / DashScope).
+A single-server Discord bot: `/flux-3`, `/sd2` and `/autobypass`.
 
 ## Commands
 
-`/flux-3` — FLUX 3 (Synthesia AI Playground, free disposable accounts)
+`/flux-3` — FLUX 3
 - `prompt` (required)
 - `duration` — 5, 10 (default), 15, 20 seconds
 - `ratio` — 16:9 (default), 9:16
 
-`/sd2` — Seedance 2.0 (Volcengine ARK, your ARK key)
+`/sd2` — Seedance 2.0
 - `prompt` (required)
 - `duration` — 5, 10 (default), 15 seconds
 - `resolution` — 480p, 720p (default)
@@ -18,24 +17,32 @@ Model Studio / DashScope).
 - `img1`–`img3` — optional reference images
 - `vid1` — optional reference video
 
-Set `ARK_API_KEY` (and `ARK_BASE_URL`) in `.env` for `/sd2`. Reference images/videos
-are passed to ARK as their Discord attachment URLs (no upload). `/flux-3` needs no
-key — it creates a throwaway Synthesia account per run.
+`/autobypass` — fires 10 Seedance 2.0 renders (15s • 16:9 • 720p) of the prompt
+template with `videointro.mov` attached as the reference video, waits for every
+render, then uses ffmpeg to judge which render has the least intro (the scene
+cut point is detected from the black gap / fade / crossfade after the intro)
+and delivers that render trimmed to the scene.
+- `prompt` (required) — the scene the video should cut to after the intro
+- If every render is a content violation: "All videos were content violation,
+  try again".
 
 ## Setup
 
 1. `npm install`
-2. Fill `.env`:
-   - `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_GUILD_ID`
-   - `DASHSCOPE_API_KEY` — your Model Studio key
-   - `DASHSCOPE_BASE_URL` — `https://dashscope.aliyuncs.com` (mainland) or
-     `https://dashscope-intl.aliyuncs.com` (international), matching your key
-3. `npm run register` — registers `/wan-3` in your server
+2. Fill `.env`: `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_GUILD_ID`,
+   `ARK_API_KEY` (used by `/sd2` and `/autobypass`)
+3. `npm run register`
 4. `npm start`
+
+`ffmpeg` must be on the host `PATH` (or set `FFMPEG_PATH`) — `/autobypass`
+needs it for scene detection and trimming.
 
 ## Notes
 
-- Reference images/videos are passed to WAN as their Discord attachment URLs —
+- `videointro.mov` (project root) is uploaded once per bot session and its
+  Discord attachment URL is reused as the reference video. Override with
+  `AUTOBYPASS_REF_VIDEO_URL`, or point `AUTOBYPASS_INTRO_PATH` elsewhere.
+- Reference images/videos are passed to ARK as their Discord attachment URLs —
   no upload step.
 - Generations are persisted to `GEN_JOB_STORE_DIR` the moment they're submitted,
   so a restart / OOM-kill / deploy mid-render resumes and delivers on next boot.

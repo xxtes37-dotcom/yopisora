@@ -14,6 +14,8 @@ import {
 } from 'discord.js';
 import { createReadStream } from 'node:fs';
 import { unlink } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { join, dirname } from 'node:path';
 import {
   FluxClient,
   FluxError,
@@ -33,6 +35,7 @@ import {
 } from './sd2.js';
 import { createSlotManager } from './slots.js';
 import { createJobStore } from './jobstore.js';
+import { analyzeVideo, trimVideo, AutoBypassError } from './autobypass.js';
 
 const {
   DISCORD_TOKEN,
@@ -309,6 +312,7 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName === 'flux-3') return runFluxGeneration(interaction);
   if (interaction.commandName === 'sd2') return runSd2Generation(interaction);
+  if (interaction.commandName === 'autobypass') return runAutoBypass(interaction);
 });
 
 // ─── /sd2 multi-fire (user 1242996784301740032 only) ─────────────────────────
@@ -523,6 +527,275 @@ async function handleSd2MultiModal(interaction) {
     .addFields({ name: 'Settings', value: sd2Settings(duration, ratio, resolution) })
     .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
     .setTimestamp());
+}
+
+// ─── /autobypass ─────────────────────────────────────────────────────────────
+// Fires 10 Seedance 2.0 renders of the prompt template (intro clip as the
+// reference video), waits for every one, then uses ffmpeg to judge which
+// render has the least intro and delivers that one trimmed to the scene.
+
+const AB_ROOT_DIR = dirname(fileURLToPath(import.meta.url)) + '/..';
+const AB_INTRO_PATH = process.env.AUTOBYPASS_INTRO_PATH || join(AB_ROOT_DIR, 'videointro.mov');
+const AB_COUNT = 10;
+const AB_SUBMIT_CONCURRENCY = 5;
+const AB_DELIVER_CONCURRENCY = 5;
+const AB_DURATION = 15;
+const AB_RESOLUTION = '720p';
+const AB_RATIO = '16:9';
+const AB_PROMPT_TEMPLATE = (userPrompt) =>
+  `a X mask hovering in a white void for 0.2 seconds, then at the 0.3 second mark then the video instantly cuts to ${userPrompt} [refrence Video 1 for how long X mask stays on screen when video turns black that's when cut starts]`;
+
+let abRefVideoUrl = process.env.AUTOBYPASS_REF_VIDEO_URL || null;
+
+async function ensureRefVideoUrl(channel) {
+  if (abRefVideoUrl) return abRefVideoUrl;
+  const msg = await channel.send({
+    content: '\u200b',
+    files: [new AttachmentBuilder(AB_INTRO_PATH, { name: 'videointro.mov' })],
+  });
+  const att = msg.attachments.first();
+  if (!att) throw new AutoBypassError('Could not upload the intro reference clip.');
+  abRefVideoUrl = att.url;
+  return abRefVideoUrl;
+}
+
+async function runAutoBypass(interaction) {
+  const commandName = 'Auto Bypass';
+
+  if (interaction.guildId !== DISCORD_GUILD_ID) {
+    await interaction.reply({ content: 'This bot only works in its home server.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const user = interaction.user;
+  const jobId = takeSlot(user.id);
+  if (!jobId) {
+    await interaction.reply({
+      content: `You already have ${runningCount(user.id)} of ${MAX_PER_USER} generations running \u2014 wait for one to finish.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const userPrompt = interaction.options.getString('prompt', true);
+  const startedAt = Date.now();
+  const { finalise, replyToAnchor, setAnchor } = makeAnchorFns({ interaction });
+  const abSettings = (extra = []) =>
+    [`\`${AB_DURATION}s\``, `\`${AB_RATIO}\``, `\`${AB_RESOLUTION}\``, `\`${AB_COUNT} renders\``, ...extra].join(' \u2022 ');
+
+  const localFiles = [];
+  const cleanup = async () => {
+    await Promise.all(localFiles.splice(0).map((p) => safeUnlink(p)));
+  };
+
+  try {
+    const channel = interaction.channel ?? (await client.channels.fetch(interaction.channelId));
+    if (!channel) throw new AutoBypassError('Could not resolve the channel for this run.');
+
+    await interaction.deferReply();
+
+    const firing = new EmbedBuilder()
+      .setColor(COLOR_WORKING)
+      .setAuthor({ name: commandName })
+      .setTitle(`Firing ${AB_COUNT} bypass renders`)
+      .setDescription(`>>> ${truncate(userPrompt, 900)}`)
+      .addFields({ name: 'Settings', value: abSettings() })
+      .setFooter({ text: `Requested by ${user.username} \u2022 submitting\u2026`, iconURL: user.displayAvatarURL() })
+      .setTimestamp();
+    const anchor = await interaction.editReply({ embeds: [firing] });
+    setAnchor(anchor);
+
+    const refUrl = await ensureRefVideoUrl(channel);
+    const finalPrompt = AB_PROMPT_TEMPLATE(userPrompt);
+    const references = [{ type: 'video', url: refUrl }];
+
+    const submitted = [];
+    let submitBlocked = 0;
+    let submitFailed = 0;
+
+    await runPool(AB_COUNT, AB_SUBMIT_CONCURRENCY, async (i) => {
+      try {
+        const { taskId } = await sd2.createTask({
+          prompt: finalPrompt,
+          duration: AB_DURATION,
+          resolution: AB_RESOLUTION,
+          ratio: AB_RATIO,
+          references,
+        });
+        submitted.push({ i, taskId });
+      } catch (err) {
+        if (err?.blocked) submitBlocked += 1;
+        else submitFailed += 1;
+        console.error(`[autobypass] submit ${i + 1}/${AB_COUNT} failed: ${err?.message ?? err}`);
+      }
+    });
+
+    const live = new EmbedBuilder()
+      .setColor(COLOR_WORKING)
+      .setAuthor({ name: commandName })
+      .setTitle(submitted.length ? `All of them are generating!` : 'Could not start renders')
+      .setDescription(`>>> ${truncate(userPrompt, 900)}`)
+      .addFields({
+        name: 'Status',
+        value: submitted.length
+          ? `Submitted ${submitted.length} of ${AB_COUNT}. Waiting on the renders.`
+          : 'Every submit failed \u2014 nothing is running.',
+      })
+      .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
+      .setTimestamp();
+    await finalise(live);
+
+    if (!submitted.length) {
+      if (submitBlocked >= AB_COUNT) {
+        await finalise(new EmbedBuilder()
+          .setColor(COLOR_BLOCKED)
+          .setAuthor({ name: commandName })
+          .setTitle('All videos were content violation, try again')
+          .setDescription(`>>> ${truncate(userPrompt, 900)}`)
+          .addFields({ name: 'Settings', value: abSettings() })
+          .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
+          .setTimestamp());
+      } else {
+        await handleGenerationError(new Error('Could not start any renders.'), {
+          finalise, replyToAnchor, prompt: userPrompt, user,
+          idRef: { value: null }, commandName, idLabel: 'ID',
+        });
+      }
+      return;
+    }
+
+    const successes = [];
+    let genViolations = submitBlocked;
+    let genFailed = submitFailed;
+
+    await runPool(submitted.length, AB_DELIVER_CONCURRENCY, async (idx) => {
+      const item = submitted[idx];
+      try {
+        const { videoUrl } = await sd2.waitForTask(item.taskId, {
+          intervalMs: POLL_MS, timeoutMs: VIDEO_TIMEOUT, onUpdate: () => {},
+        });
+        const file = await sd2.downloadFile(videoUrl);
+        localFiles.push(file.path);
+        successes.push({ i: item.i, path: file.path, bytes: file.bytes });
+        console.log(`[autobypass] ${item.taskId} (${item.i + 1}/${submitted.length}) rendered (${(file.bytes / MB).toFixed(1)} MB)`);
+      } catch (err) {
+        if (err?.blocked) genViolations += 1;
+        else genFailed += 1;
+        console.error(`[autobypass] render ${item.i + 1}/${submitted.length} failed: ${err?.message ?? err}`);
+      }
+    });
+
+    if (!successes.length) {
+      if (genViolations >= AB_COUNT) {
+        await finalise(new EmbedBuilder()
+          .setColor(COLOR_BLOCKED)
+          .setAuthor({ name: commandName })
+          .setTitle('All videos were content violation, try again')
+          .setDescription(`>>> ${truncate(userPrompt, 900)}`)
+          .addFields({ name: 'Settings', value: abSettings() })
+          .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
+          .setTimestamp());
+      } else {
+        await handleGenerationError(new Error('None of the renders finished.'), {
+          finalise, replyToAnchor, prompt: userPrompt, user,
+          idRef: { value: null }, commandName, idLabel: 'ID',
+        });
+      }
+      return;
+    }
+
+    const judging = new EmbedBuilder()
+      .setColor(COLOR_WORKING)
+      .setAuthor({ name: commandName })
+      .setTitle('Judging the renders')
+      .setDescription(`>>> ${truncate(userPrompt, 900)}`)
+      .addFields({
+        name: 'Status',
+        value: `${successes.length} of ${submitted.length} rendered. Detecting the scene cut with ffmpeg\u2026`,
+      })
+      .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
+      .setTimestamp();
+    await finalise(judging);
+
+    const candidates = [];
+    for (const s of successes) {
+      try {
+        const { sceneStart, method } = await analyzeVideo(s.path);
+        candidates.push({ ...s, sceneStart, method });
+        console.log(`[autobypass] render ${s.i + 1}: sceneStart=${sceneStart === null ? '??' : sceneStart.toFixed(3)} (${method})`);
+      } catch (err) {
+        console.error(`[autobypass] analyze render ${s.i + 1} failed: ${err?.message ?? err}`);
+        candidates.push({ ...s, sceneStart: null, method: 'error' });
+      }
+    }
+
+    const measurable = candidates.filter((c) => c.sceneStart !== null);
+    const best = measurable.length
+      ? measurable.reduce((a, b) => (b.sceneStart < a.sceneStart ? b : a))
+      : candidates[0];
+    const trimmedOk = Boolean(best.sceneStart !== null);
+
+    let deliverPath = best.path;
+    if (trimmedOk) {
+      const trimmedPath = await trimVideo(best.path, best.sceneStart);
+      localFiles.push(trimmedPath);
+      deliverPath = trimmedPath;
+    }
+
+    const introCut = trimmedOk ? best.sceneStart : 0;
+    const sceneLen = trimmedOk ? Math.max(0, AB_DURATION - best.sceneStart) : AB_DURATION;
+    const violationNote = genViolations ? `${genViolations} of ${submitted.length} renders were content violations.` : null;
+    const failedNote = genFailed ? `${genFailed} of ${submitted.length} renders failed.` : null;
+
+    const done = new EmbedBuilder()
+      .setColor(COLOR_DONE)
+      .setAuthor({ name: commandName })
+      .setTitle('Bypass complete')
+      .setDescription(`>>> ${truncate(userPrompt, 900)}`)
+      .addFields(
+        { name: 'Settings', value: abSettings([`\`${fmtElapsed(Date.now() - startedAt)}\``]) },
+        { name: 'Winner', value: `Render #${best.i + 1} of ${submitted.length} \u2014 least intro` },
+        { name: 'Trim', value: trimmedOk
+          ? `Cut \`${introCut.toFixed(2)}s\` of intro \u2022 \`${sceneLen.toFixed(2)}s\` of clean scene`
+          : 'Could not detect the intro \u2014 delivering the render untrimmed' },
+      )
+      .setFooter({
+        text: [`Requested by ${user.username}`, violationNote, failedNote].filter(Boolean).join(' \u2022 '),
+        iconURL: user.displayAvatarURL(),
+      })
+      .setTimestamp();
+    await finalise(done);
+
+    const limit = uploadLimitBytes(interaction.guild);
+    const mb = (best.bytes / MB).toFixed(1);
+    if (best.bytes >= limit) {
+      await replyToAnchor({ content: `${user} The trimmed video is ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
+    } else {
+      await replyToAnchor({
+        content: `${user}`,
+        files: [new AttachmentBuilder(createReadStream(deliverPath), { name: 'autobypass-video.mp4' })],
+      });
+    }
+    console.log(`[autobypass] delivered render ${best.i + 1}/${submitted.length} (cut ${introCut.toFixed(2)}s) in ${fmtElapsed(Date.now() - startedAt)}`);
+  } catch (err) {
+    if (!(err instanceof AutoBypassError)) console.error(err);
+    try {
+      await handleGenerationError(err, {
+        finalise, replyToAnchor, prompt: userPrompt, user,
+        idRef: { value: null }, commandName, idLabel: 'ID',
+      });
+    } catch (fatal) {
+      console.error(`Unhandled error in ${commandName} for ${user.tag}:`, fatal);
+      try {
+        const body = { content: 'Something went wrong starting that generation.' };
+        if (interaction.deferred || interaction.replied) await interaction.editReply(body);
+        else await interaction.reply({ ...body, flags: MessageFlags.Ephemeral });
+      } catch { /* interaction unusable */ }
+    }
+  } finally {
+    await cleanup();
+    releaseSlot(user.id, jobId);
+  }
 }
 
 // ─── /sd2 generation handler (Seedance 2.0 via Volcengine ARK) ───────────────
