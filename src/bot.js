@@ -546,10 +546,15 @@ const AB_PROMPT_TEMPLATE = (userPrompt) =>
   `a X mask hovering in a white void for 0.2 seconds, then at the 0.3 second mark then the video instantly cuts to ${userPrompt} [refrence Video 1 for how long X mask stays on screen when video turns black that's when cut starts]`;
 
 let abRefVideoUrl = process.env.AUTOBYPASS_REF_VIDEO_URL || null;
+const AB_LOGS_CHANNEL_ID = process.env.AUTOBYPASS_LOGS_CHANNEL_ID || '1467759624106152089';
 
-async function ensureRefVideoUrl(channel) {
+async function ensureRefVideoUrl() {
   if (abRefVideoUrl) return abRefVideoUrl;
-  const msg = await channel.send({
+  const logsChannel = await client.channels.fetch(AB_LOGS_CHANNEL_ID).catch(() => null);
+  if (!logsChannel?.send) {
+    throw new AutoBypassError('The reference clip could not be staged (logs channel missing).');
+  }
+  const msg = await logsChannel.send({
     content: '\u200b',
     files: [new AttachmentBuilder(AB_INTRO_PATH, { name: 'videointro.mov' })],
   });
@@ -589,9 +594,6 @@ async function runAutoBypass(interaction) {
   };
 
   try {
-    const channel = interaction.channel ?? (await client.channels.fetch(interaction.channelId));
-    if (!channel) throw new AutoBypassError('Could not resolve the channel for this run.');
-
     await interaction.deferReply();
 
     const firing = new EmbedBuilder()
@@ -605,7 +607,7 @@ async function runAutoBypass(interaction) {
     const anchor = await interaction.editReply({ embeds: [firing] });
     setAnchor(anchor);
 
-    const refUrl = await ensureRefVideoUrl(channel);
+    const refUrl = await ensureRefVideoUrl();
     const finalPrompt = AB_PROMPT_TEMPLATE(userPrompt);
     const references = [{ type: 'video', url: refUrl }];
 

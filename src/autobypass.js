@@ -4,10 +4,11 @@ import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { unlink } from 'node:fs/promises';
+import staticFFmpeg from 'ffmpeg-static';
 
 const pExecFile = promisify(execFile);
 
-const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg';
+const FFMPEG_BIN = process.env.FFMPEG_PATH || staticFFmpeg || 'ffmpeg';
 
 export class AutoBypassError extends Error {
   constructor(message, { blocked = false } = {}) {
