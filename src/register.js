@@ -21,15 +21,6 @@ import {
   SD2_MAX_IMAGES,
   SD2_MAX_VIDEOS,
 } from './sd2.js';
-import {
-  WAN_DURATIONS,
-  WAN_DEFAULT_DURATION,
-  WAN_RATIOS,
-  WAN_DEFAULT_RATIO,
-  WAN_RESOLUTIONS,
-  WAN_DEFAULT_RESOLUTION,
-  WAN_MAX_IMAGES,
-} from './wan.js';
 
 const { DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID } = process.env;
 
@@ -102,38 +93,11 @@ const autobypassBuilder = new SlashCommandBuilder()
     o.setName('prompt').setDescription('The scene the video should cut to after the intro').setRequired(true).setMaxLength(3000),
   );
 
-/**
- * /wan-3 \u2014 WAN 3.0 video via the generation proxy.
- * Audio always on. prompt, duration (5\u201330s), ratio, resolution (480p/720p),
- * up to 3 reference images.
- */
-const wan3Builder = new SlashCommandBuilder()
-  .setName('wan-3')
-  .setDescription('Generate a video with WAN 3.0')
-  .addStringOption((o) =>
-    o.setName('prompt').setDescription('What should the video show?').setRequired(true).setMaxLength(4000),
-  )
-  .addIntegerOption((o) =>
-    o.setName('duration').setDescription(`Length in seconds (default ${WAN_DEFAULT_DURATION})`)
-      .addChoices(...WAN_DURATIONS.map((d) => ({ name: `${d}s${d === WAN_DEFAULT_DURATION ? ' (default)' : ''}`, value: d }))),
-  )
-  .addStringOption((o) =>
-    o.setName('ratio').setDescription(`Aspect ratio (default ${WAN_DEFAULT_RATIO})`)
-      .addChoices(...WAN_RATIOS.map((r) => ({ name: r === WAN_DEFAULT_RATIO ? `${r} (default)` : r, value: r }))),
-  )
-  .addStringOption((o) =>
-    o.setName('resolution').setDescription(`Output resolution (default ${WAN_DEFAULT_RESOLUTION})`)
-      .addChoices(...WAN_RESOLUTIONS.map((r) => ({ name: r === WAN_DEFAULT_RESOLUTION ? `${r} (default)` : r, value: r }))),
-  )
-  .addAttachmentOption((o) => o.setName('img1').setDescription(`Reference image (optional, up to ${WAN_MAX_IMAGES})`))
-  .addAttachmentOption((o) => o.setName('img2').setDescription('A second reference image (optional)'))
-  .addAttachmentOption((o) => o.setName('img3').setDescription('A third reference image (optional)'));
-
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 const route = Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID);
 
 try {
-  const data = await rest.put(route, { body: [flux3Builder.toJSON(), sd2Builder.toJSON(), autobypassBuilder.toJSON(), wan3Builder.toJSON()] });
+  const data = await rest.put(route, { body: [flux3Builder.toJSON(), sd2Builder.toJSON(), autobypassBuilder.toJSON()] });
   console.log(`Registered ${data.length} command(s) in server ${DISCORD_GUILD_ID}:`);
   for (const c of data) {
     console.log(`  /${c.name} \u2014 ${c.description}`);
