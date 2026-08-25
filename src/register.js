@@ -91,7 +91,10 @@ const autobypassBuilder = new SlashCommandBuilder()
   .setDescription('Fire 4 renders of your prompt and deliver the cleanest one, intro trimmed')
   .addStringOption((o) =>
     o.setName('prompt').setDescription('The scene the video should cut to after the intro').setRequired(true).setMaxLength(3000),
-  );
+  )
+  .addAttachmentOption((o) => o.setName('img1').setDescription(`Reference image (optional, up to 3) \u2014 passed as a reference, not a first frame`))
+  .addAttachmentOption((o) => o.setName('img2').setDescription('A second reference image (optional)'))
+  .addAttachmentOption((o) => o.setName('img3').setDescription('A third reference image (optional)'));
 
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 const route = Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID);

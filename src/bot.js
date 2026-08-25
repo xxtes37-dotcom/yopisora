@@ -596,6 +596,15 @@ async function runAutoBypass(interaction) {
   try {
     await interaction.deferReply();
 
+    const { images: imgAtts, error: refError } = collectReferences(
+      interaction, ['img1', 'img2', 'img3'], SD2_MAX_IMAGES, [], 0,
+    );
+    if (refError) {
+      await interaction.editReply({ content: refError });
+      return;
+    }
+    const refCount = imgAtts?.length ?? 0;
+
     const firing = new EmbedBuilder()
       .setColor(COLOR_WORKING)
       .setAuthor({ name: commandName })
@@ -604,12 +613,19 @@ async function runAutoBypass(interaction) {
       .addFields({ name: 'Settings', value: abSettingsLine() })
       .setFooter({ text: `Requested by ${user.username} \u2022 submitting\u2026`, iconURL: user.displayAvatarURL() })
       .setTimestamp();
+    if (refCount) {
+      firing.addFields({ name: 'References', value: `${refCount} image${refCount > 1 ? 's' : ''}` });
+      firing.setThumbnail(imgAtts[0].url);
+    }
     const anchor = await interaction.editReply({ embeds: [firing] });
     setAnchor(anchor);
 
     const refUrl = await ensureRefVideoUrl();
     const finalPrompt = AB_PROMPT_TEMPLATE(userPrompt);
-    const references = [{ type: 'video', url: refUrl }];
+    const references = [
+      { type: 'video', url: refUrl },
+      ...(imgAtts ?? []).map((a) => ({ type: 'image', url: a.url })),
+    ];
 
     const submitted = [];
     let submitBlocked = 0;
