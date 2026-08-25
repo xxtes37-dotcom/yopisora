@@ -1,6 +1,6 @@
 # Yopisora — video bot
 
-A single-server Discord bot: `/flux-3`, `/sd2` and `/autobypass`.
+A single-server Discord bot: `/flux-3`, `/sd2`, `/autobypass` and `/wan-3`.
 
 ## Commands
 
@@ -17,7 +17,7 @@ A single-server Discord bot: `/flux-3`, `/sd2` and `/autobypass`.
 - `img1`–`img3` — optional reference images
 - `vid1` — optional reference video
 
-`/autobypass` — fires 10 Seedance 2.0 renders (15s • 16:9 • 720p) of the prompt
+`/autobypass` — fires 4 Seedance 2.0 renders (15s • 16:9 • 480p) of the prompt
 template with `videointro.mov` attached as the reference video, waits for every
 render, then uses ffmpeg to judge which render has the least intro (the scene
 cut point is detected from the black gap / fade / crossfade after the intro)
@@ -25,12 +25,23 @@ and delivers that render trimmed to the scene.
 - `prompt` (required) — the scene the video should cut to after the intro
 - If every render is a content violation: "All videos were content violation,
   try again".
+- The batch is persisted right after the submits, so a restart mid-batch
+  resumes on next boot (re-polls every render, judges, delivers).
+
+`/wan-3` — WAN 3.0 (audio always on)
+- `prompt` (required)
+- `duration` — 5, 10 (default), 15, 20, 25, 30 seconds
+- `ratio` — 16:9 (default), 9:16
+- `resolution` — 480p, 720p (default)
+- `img1`–`img3` — optional reference images (uploaded to the proxy's OSS and
+  passed as `input.media` reference images, like the web app does)
 
 ## Setup
 
 1. `npm install`
 2. Fill `.env`: `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_GUILD_ID`,
-   `ARK_API_KEY` (used by `/sd2` and `/autobypass`)
+   `ARK_API_KEY` (used by `/sd2` and `/autobypass`). `/wan-3` needs no key —
+   set `WAN_BASE_URL` to override the proxy address.
 3. `npm run register`
 4. `npm start`
 

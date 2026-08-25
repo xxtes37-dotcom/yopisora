@@ -1,4 +1,4 @@
-import 'dotenv/config';
+﻿import 'dotenv/config';
 import {
   Client,
   GatewayIntentBits,
@@ -36,6 +36,17 @@ import {
 import { createSlotManager } from './slots.js';
 import { createJobStore } from './jobstore.js';
 import { analyzeVideo, trimVideo, AutoBypassError } from './autobypass.js';
+import {
+  WanClient,
+  WanError,
+  WAN_DURATIONS,
+  WAN_DEFAULT_DURATION,
+  WAN_RATIOS,
+  WAN_DEFAULT_RATIO,
+  WAN_RESOLUTIONS,
+  WAN_DEFAULT_RESOLUTION,
+  WAN_MAX_IMAGES,
+} from './wan.js';
 
 const {
   DISCORD_TOKEN,
@@ -61,6 +72,7 @@ if (!ARK_API_KEY) {
 
 const flux = new FluxClient();
 const sd2 = new Sd2Client();
+const wan = new WanClient();
 const jobStore = createJobStore({ dir: process.env.GEN_JOB_STORE_DIR || './.jobs' });
 
 const safeUnlink = (p) => (p ? unlink(p).catch(() => {}) : Promise.resolve());
@@ -90,7 +102,7 @@ const UNLIMITED_USER_IDS = new Set(
 );
 const isUnlimited = (userId) => UNLIMITED_USER_IDS.has(String(userId));
 
-// User who gets the multi-generation flow on /sd2 (modal → fire N gens).
+// User who gets the multi-generation flow on /sd2 (modal â†’ fire N gens).
 const SD2_MULTI_USER_ID = '1242996784301740032';
 const isSd2MultiUser = (userId) => String(userId) === SD2_MULTI_USER_ID;
 
@@ -153,11 +165,11 @@ client.once('clientReady', async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   console.log(`Server: ${DISCORD_GUILD_ID} (locked)`);
   console.log(`Limit:  ${MAX_PER_USER} concurrent per user (cleared on restart)`);
-  c.user.setActivity('/flux-3 • /sd2', { type: ActivityType.Listening });
+  c.user.setActivity('/flux-3 â€¢ /sd2', { type: ActivityType.Listening });
   resumePendingJobs().catch((err) => console.error('Resume sweep failed:', err));
 });
 
-// ─── Shared helpers ──────────────────────────────────────────────────────────
+// â”€â”€â”€ Shared helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function makeAnchorFns({ interaction = null, channel = null } = {}) {
   let anchor = null;
@@ -313,9 +325,10 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.commandName === 'flux-3') return runFluxGeneration(interaction);
   if (interaction.commandName === 'sd2') return runSd2Generation(interaction);
   if (interaction.commandName === 'autobypass') return runAutoBypass(interaction);
+  if (interaction.commandName === 'wan-3') return runWanGeneration(interaction);
 });
 
-// ─── /sd2 multi-fire (user 1242996784301740032 only) ─────────────────────────
+// â”€â”€â”€ /sd2 multi-fire (user 1242996784301740032 only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Modal asks how many to fire. Same prompt + references go on every request.
 // Submit is pooled so 100 gens don't open 100 sockets at once.
 
@@ -359,7 +372,7 @@ async function promptSd2Multi(interaction) {
           .setRequired(true)
           .setMinLength(1)
           .setMaxLength(3)
-          .setPlaceholder(`1–${SD2_MULTI_MAX}`),
+          .setPlaceholder(`1â€“${SD2_MULTI_MAX}`),
       ),
     );
 
@@ -380,7 +393,7 @@ async function handleSd2MultiModal(interaction) {
   const pending = pendingSd2Multi.get(user.id);
   pendingSd2Multi.delete(user.id);
   if (!pending || pending.expiresAt < Date.now()) {
-    await interaction.reply({ content: 'That request expired — run /sd2 again.', flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: 'That request expired â€” run /sd2 again.', flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -397,7 +410,7 @@ async function handleSd2MultiModal(interaction) {
   const commandName = 'Seedance 2.0';
   const { prompt, duration, resolution, ratio, references } = pending;
   const refCount = pending.imgCount + pending.vidCount;
-  const sd2Settings = (d, rt, res, extra = []) => [`\`${d}s\``, `\`${rt}\``, `\`${res}\``, ...extra].join(' • ');
+  const sd2Settings = (d, rt, res, extra = []) => [`\`${d}s\``, `\`${rt}\``, `\`${res}\``, ...extra].join(' â€¢ ');
 
   await interaction.deferReply();
 
@@ -407,7 +420,7 @@ async function handleSd2MultiModal(interaction) {
     .setTitle(`Firing ${count} generation${count === 1 ? '' : 's'}`)
     .setDescription(`>>> ${truncate(prompt, 900)}`)
     .addFields({ name: 'Settings', value: sd2Settings(duration, ratio, resolution) })
-    .setFooter({ text: `Requested by ${user.username} • submitting…`, iconURL: user.displayAvatarURL() })
+    .setFooter({ text: `Requested by ${user.username} â€¢ submittingâ€¦`, iconURL: user.displayAvatarURL() })
     .setTimestamp();
   if (refCount) {
     const refSummary = [
@@ -457,7 +470,7 @@ async function handleSd2MultiModal(interaction) {
       name: 'Status',
       value: submitted.length
         ? `Submitted ${submitted.length} of ${count}. Waiting on the renders.`
-        : 'Every submit failed — nothing is running.',
+        : 'Every submit failed â€” nothing is running.',
     })
     .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
     .setTimestamp();
@@ -472,7 +485,7 @@ async function handleSd2MultiModal(interaction) {
     return;
   }
 
-  // Each render is independent — one failure must not cancel the rest.
+  // Each render is independent â€” one failure must not cancel the rest.
   await runPool(submitted.length, SD2_MULTI_DELIVER_CONCURRENCY, async (idx) => {
     const item = submitted[idx];
     const idRef = { value: item.taskId };
@@ -529,7 +542,7 @@ async function handleSd2MultiModal(interaction) {
     .setTimestamp());
 }
 
-// ─── /autobypass ─────────────────────────────────────────────────────────────
+// â”€â”€â”€ /autobypass â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Fires 10 Seedance 2.0 renders of the prompt template (intro clip as the
 // reference video), waits for every one, then uses ffmpeg to judge which
 // render has the least intro and delivers that one trimmed to the scene.
@@ -544,6 +557,8 @@ const AB_RESOLUTION = '480p';
 const AB_RATIO = '16:9';
 const AB_PROMPT_TEMPLATE = (userPrompt) =>
   `a X mask hovering in a white void for 0.2 seconds, then at the 0.3 second mark then the video instantly cuts to ${userPrompt} [refrence Video 1 for how long X mask stays on screen when video turns black that's when cut starts]`;
+const abSettingsLine = (extra = []) =>
+  [`\`${AB_DURATION}s\``, `\`${AB_RATIO}\``, `\`${AB_RESOLUTION}\``, `\`${AB_COUNT} renders\``, ...extra].join(' \u2022 ');
 
 let abRefVideoUrl = process.env.AUTOBYPASS_REF_VIDEO_URL || null;
 const AB_LOGS_CHANNEL_ID = process.env.AUTOBYPASS_LOGS_CHANNEL_ID || '1467759624106152089';
@@ -585,8 +600,6 @@ async function runAutoBypass(interaction) {
   const userPrompt = interaction.options.getString('prompt', true);
   const startedAt = Date.now();
   const { finalise, replyToAnchor, setAnchor } = makeAnchorFns({ interaction });
-  const abSettings = (extra = []) =>
-    [`\`${AB_DURATION}s\``, `\`${AB_RATIO}\``, `\`${AB_RESOLUTION}\``, `\`${AB_COUNT} renders\``, ...extra].join(' \u2022 ');
 
   const localFiles = [];
   const cleanup = async () => {
@@ -601,7 +614,7 @@ async function runAutoBypass(interaction) {
       .setAuthor({ name: commandName })
       .setTitle(`Firing ${AB_COUNT} bypass renders`)
       .setDescription(`>>> ${truncate(userPrompt, 900)}`)
-      .addFields({ name: 'Settings', value: abSettings() })
+      .addFields({ name: 'Settings', value: abSettingsLine() })
       .setFooter({ text: `Requested by ${user.username} \u2022 submitting\u2026`, iconURL: user.displayAvatarURL() })
       .setTimestamp();
     const anchor = await interaction.editReply({ embeds: [firing] });
@@ -654,7 +667,7 @@ async function runAutoBypass(interaction) {
           .setAuthor({ name: commandName })
           .setTitle('All videos were content violation, try again')
           .setDescription(`>>> ${truncate(userPrompt, 900)}`)
-          .addFields({ name: 'Settings', value: abSettings() })
+          .addFields({ name: 'Settings', value: abSettingsLine() })
           .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
           .setTimestamp());
       } else {
@@ -664,6 +677,25 @@ async function runAutoBypass(interaction) {
         });
       }
       return;
+    }
+
+    // Persist before waiting so a restart / kill mid-batch resumes on next boot.
+    try {
+      await jobStore.save({
+        jobId,
+        kind: 'autobypass',
+        userId: user.id,
+        guildId: interaction.guildId,
+        channelId: interaction.channelId,
+        anchorMessageId: anchor.id,
+        prompt: userPrompt,
+        taskIds: submitted.map((s) => s.taskId),
+        submittedCount: submitted.length,
+        deadlineAt: Date.now() + VIDEO_TIMEOUT,
+        createdAt: Date.now(),
+      });
+    } catch (err) {
+      console.warn(`Could not persist autobypass job ${jobId}: ${err?.message ?? err}`);
     }
 
     const successes = [];
@@ -687,98 +719,11 @@ async function runAutoBypass(interaction) {
       }
     });
 
-    if (!successes.length) {
-      if (genViolations >= AB_COUNT) {
-        await finalise(new EmbedBuilder()
-          .setColor(COLOR_BLOCKED)
-          .setAuthor({ name: commandName })
-          .setTitle('All videos were content violation, try again')
-          .setDescription(`>>> ${truncate(userPrompt, 900)}`)
-          .addFields({ name: 'Settings', value: abSettings() })
-          .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
-          .setTimestamp());
-      } else {
-        await handleGenerationError(new Error('None of the renders finished.'), {
-          finalise, replyToAnchor, prompt: userPrompt, user,
-          idRef: { value: null }, commandName, idLabel: 'ID',
-        });
-      }
-      return;
-    }
-
-    const judging = new EmbedBuilder()
-      .setColor(COLOR_WORKING)
-      .setAuthor({ name: commandName })
-      .setTitle('Judging the renders')
-      .setDescription(`>>> ${truncate(userPrompt, 900)}`)
-      .addFields({
-        name: 'Status',
-        value: `${successes.length} of ${submitted.length} rendered. Detecting the scene cut with ffmpeg\u2026`,
-      })
-      .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
-      .setTimestamp();
-    await finalise(judging);
-
-    const candidates = [];
-    for (const s of successes) {
-      try {
-        const { sceneStart, method } = await analyzeVideo(s.path);
-        candidates.push({ ...s, sceneStart, method });
-        console.log(`[autobypass] render ${s.i + 1}: sceneStart=${sceneStart === null ? '??' : sceneStart.toFixed(3)} (${method})`);
-      } catch (err) {
-        console.error(`[autobypass] analyze render ${s.i + 1} failed: ${err?.message ?? err}`);
-        candidates.push({ ...s, sceneStart: null, method: 'error' });
-      }
-    }
-
-    const measurable = candidates.filter((c) => c.sceneStart !== null);
-    const best = measurable.length
-      ? measurable.reduce((a, b) => (b.sceneStart < a.sceneStart ? b : a))
-      : candidates[0];
-    const trimmedOk = Boolean(best.sceneStart !== null);
-
-    let deliverPath = best.path;
-    if (trimmedOk) {
-      const trimmedPath = await trimVideo(best.path, best.sceneStart);
-      localFiles.push(trimmedPath);
-      deliverPath = trimmedPath;
-    }
-
-    const introCut = trimmedOk ? best.sceneStart : 0;
-    const sceneLen = trimmedOk ? Math.max(0, AB_DURATION - best.sceneStart) : AB_DURATION;
-    const violationNote = genViolations ? `${genViolations} of ${submitted.length} renders were content violations.` : null;
-    const failedNote = genFailed ? `${genFailed} of ${submitted.length} renders failed.` : null;
-
-    const done = new EmbedBuilder()
-      .setColor(COLOR_DONE)
-      .setAuthor({ name: commandName })
-      .setTitle('Bypass complete')
-      .setDescription(`>>> ${truncate(userPrompt, 900)}`)
-      .addFields(
-        { name: 'Settings', value: abSettings([`\`${fmtElapsed(Date.now() - startedAt)}\``]) },
-        { name: 'Winner', value: `Render #${best.i + 1} of ${submitted.length} \u2014 least intro` },
-        { name: 'Trim', value: trimmedOk
-          ? `Cut \`${introCut.toFixed(2)}s\` of intro \u2022 \`${sceneLen.toFixed(2)}s\` of clean scene`
-          : 'Could not detect the intro \u2014 delivering the render untrimmed' },
-      )
-      .setFooter({
-        text: [`Requested by ${user.username}`, violationNote, failedNote].filter(Boolean).join(' \u2022 '),
-        iconURL: user.displayAvatarURL(),
-      })
-      .setTimestamp();
-    await finalise(done);
-
-    const limit = uploadLimitBytes(interaction.guild);
-    const mb = (best.bytes / MB).toFixed(1);
-    if (best.bytes >= limit) {
-      await replyToAnchor({ content: `${user} The trimmed video is ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
-    } else {
-      await replyToAnchor({
-        content: `${user}`,
-        files: [new AttachmentBuilder(createReadStream(deliverPath), { name: 'autobypass-video.mp4' })],
-      });
-    }
-    console.log(`[autobypass] delivered render ${best.i + 1}/${submitted.length} (cut ${introCut.toFixed(2)}s) in ${fmtElapsed(Date.now() - startedAt)}`);
+    await finishAutoBypass({
+      user, prompt: userPrompt, guild: interaction.guild,
+      successes, violations: genViolations, failed: genFailed,
+      total: submitted.length, startedAt, finalise, replyToAnchor, localFiles,
+    });
   } catch (err) {
     if (!(err instanceof AutoBypassError)) console.error(err);
     try {
@@ -797,10 +742,183 @@ async function runAutoBypass(interaction) {
   } finally {
     await cleanup();
     releaseSlot(user.id, jobId);
+    await jobStore.remove(jobId);
   }
 }
 
-// ─── /sd2 generation handler (Seedance 2.0 via Volcengine ARK) ───────────────
+// Shared tail for /autobypass: judge the downloaded renders, trim the winner,
+// deliver. Used by both the fresh run and the restart-resume path.
+async function finishAutoBypass({
+  user, prompt, guild, successes, violations, failed, total, startedAt,
+  finalise, replyToAnchor, localFiles,
+}) {
+  const commandName = 'Auto Bypass';
+
+  if (!successes.length) {
+    if (violations >= total) {
+      await finalise(new EmbedBuilder()
+        .setColor(COLOR_BLOCKED)
+        .setAuthor({ name: commandName })
+        .setTitle('All videos were content violation, try again')
+        .setDescription(`>>> ${truncate(prompt, 900)}`)
+        .addFields({ name: 'Settings', value: abSettingsLine() })
+        .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL?.() })
+        .setTimestamp());
+    } else {
+      await handleGenerationError(new Error('None of the renders finished.'), {
+        finalise, replyToAnchor, prompt, user,
+        idRef: { value: null }, commandName, idLabel: 'ID',
+      });
+    }
+    return;
+  }
+
+  const judging = new EmbedBuilder()
+    .setColor(COLOR_WORKING)
+    .setAuthor({ name: commandName })
+    .setTitle('Judging the renders')
+    .setDescription(`>>> ${truncate(prompt, 900)}`)
+    .addFields({
+      name: 'Status',
+      value: `${successes.length} of ${total} rendered. Detecting the scene cut with ffmpeg\u2026`,
+    })
+    .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL?.() })
+    .setTimestamp();
+  await finalise(judging);
+
+  const candidates = [];
+  for (const s of successes) {
+    try {
+      const { sceneStart, method } = await analyzeVideo(s.path);
+      candidates.push({ ...s, sceneStart, method });
+      console.log(`[autobypass] render ${s.i + 1}: sceneStart=${sceneStart === null ? '??' : sceneStart.toFixed(3)} (${method})`);
+    } catch (err) {
+      console.error(`[autobypass] analyze render ${s.i + 1} failed: ${err?.message ?? err}`);
+      candidates.push({ ...s, sceneStart: null, method: 'error' });
+    }
+  }
+
+  const measurable = candidates.filter((c) => c.sceneStart !== null);
+  const best = measurable.length
+    ? measurable.reduce((a, b) => (b.sceneStart < a.sceneStart ? b : a))
+    : candidates[0];
+  const trimmedOk = best.sceneStart !== null;
+
+  let deliverPath = best.path;
+  if (trimmedOk) {
+    const trimmedPath = await trimVideo(best.path, best.sceneStart);
+    localFiles.push(trimmedPath);
+    deliverPath = trimmedPath;
+  }
+
+  const introCut = trimmedOk ? best.sceneStart : 0;
+  const sceneLen = trimmedOk ? Math.max(0, AB_DURATION - best.sceneStart) : AB_DURATION;
+  const violationNote = violations ? `${violations} of ${total} renders were content violations.` : null;
+  const failedNote = failed ? `${failed} of ${total} renders failed.` : null;
+
+  const done = new EmbedBuilder()
+    .setColor(COLOR_DONE)
+    .setAuthor({ name: commandName })
+    .setTitle('Bypass complete')
+    .setDescription(`>>> ${truncate(prompt, 900)}`)
+    .addFields(
+      { name: 'Settings', value: abSettingsLine([`\`${fmtElapsed(Date.now() - startedAt)}\``]) },
+      { name: 'Winner', value: `Render #${best.i + 1} of ${total} \u2014 least intro` },
+      { name: 'Trim', value: trimmedOk
+        ? `Cut \`${introCut.toFixed(2)}s\` of intro \u2022 \`${sceneLen.toFixed(2)}s\` of clean scene`
+        : 'Could not detect the intro \u2014 delivering the render untrimmed' },
+    )
+    .setFooter({
+      text: [`Requested by ${user.username}`, violationNote, failedNote].filter(Boolean).join(' \u2022 '),
+      iconURL: user.displayAvatarURL?.(),
+    })
+    .setTimestamp();
+  await finalise(done);
+
+  const limit = uploadLimitBytes(guild);
+  const mb = (best.bytes / MB).toFixed(1);
+  if (best.bytes >= limit) {
+    await replyToAnchor({ content: `${user} The trimmed video is ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
+  } else {
+    await replyToAnchor({
+      content: `${user}`,
+      files: [new AttachmentBuilder(createReadStream(deliverPath), { name: 'autobypass-video.mp4' })],
+    });
+  }
+  console.log(`[autobypass] delivered render ${best.i + 1}/${total} (cut ${introCut.toFixed(2)}s) in ${fmtElapsed(Date.now() - startedAt)}`);
+}
+
+// Restart recovery for /autobypass: the batch was persisted right after the
+// submits, so re-poll every task id and run the same judge + trim + deliver.
+async function resumeAutoBypass(rec, { user, prompt, channel, finalise, replyToAnchor }) {
+  const localFiles = [];
+  const cleanup = async () => {
+    await Promise.all(localFiles.splice(0).map((p) => safeUnlink(p)));
+  };
+  const startedAt = Date.now();
+  try {
+    try {
+      await finalise(new EmbedBuilder()
+        .setColor(COLOR_WORKING)
+        .setAuthor({ name: 'Auto Bypass' })
+        .setTitle('Resuming your bypass run')
+        .setDescription(`>>> ${truncate(prompt, 900)}`)
+        .addFields({ name: 'Status', value: 'Picked this back up after a restart \u2014 re-polling the renders.' })
+        .setFooter({ text: user ? `Requested by ${user.username}` : 'Recovered after a restart', iconURL: user?.displayAvatarURL?.() })
+        .setTimestamp());
+    } catch { /* cosmetic */ }
+
+    const remaining = (rec.deadlineAt ?? 0) - Date.now();
+    if (remaining <= 0 || !Array.isArray(rec.taskIds) || !rec.taskIds.length) {
+      await handleGenerationError(
+        new Sd2Error(`Generation timed out after ${Math.max(1, Math.round(VIDEO_TIMEOUT / 60_000))} minutes.`, { timedOut: true }),
+        { finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId), idRef: { value: null }, commandName: 'Auto Bypass', idLabel: 'ID' },
+      );
+      return;
+    }
+
+    const successes = [];
+    let violations = 0;
+    let failed = 0;
+    const total = rec.taskIds.length;
+
+    await runPool(total, AB_DELIVER_CONCURRENCY, async (idx) => {
+      const taskId = rec.taskIds[idx];
+      try {
+        const { videoUrl } = await sd2.waitForTask(taskId, {
+          intervalMs: POLL_MS, timeoutMs: remaining, onUpdate: () => {},
+        });
+        const file = await sd2.downloadFile(videoUrl);
+        localFiles.push(file.path);
+        successes.push({ i: idx, path: file.path, bytes: file.bytes });
+        console.log(`[autobypass-resume] ${taskId} (${idx + 1}/${total}) rendered`);
+      } catch (err) {
+        if (err?.blocked) violations += 1;
+        else failed += 1;
+        console.error(`[autobypass-resume] render ${idx + 1}/${total} failed: ${err?.message ?? err}`);
+      }
+    });
+
+    await finishAutoBypass({
+      user: user ?? resumeUser(null, rec.userId), prompt, guild: channel.guild ?? null,
+      successes, violations, failed, total, startedAt, finalise, replyToAnchor, localFiles,
+    });
+  } catch (err) {
+    try {
+      await handleGenerationError(err, {
+        finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId),
+        idRef: { value: null }, commandName: 'Auto Bypass', idLabel: 'ID',
+      });
+    } catch (fatal) {
+      console.error(`Resume autobypass ${rec.jobId} delivery failed:`, fatal);
+    }
+  } finally {
+    await cleanup();
+    await jobStore.remove(rec.jobId);
+  }
+}
+
+// â”€â”€â”€ /sd2 generation handler (Seedance 2.0 via Volcengine ARK) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async function runSd2Generation(interaction) {
   const commandName = 'Seedance 2.0';
@@ -956,6 +1074,148 @@ async function runSd2Generation(interaction) {
   }
 }
 
+// ─── /wan-3 generation handler (WAN 3.0 via the generation proxy) ────────────
+// 720p fixed, audio always on. Up to 3 reference images.
+
+async function runWanGeneration(interaction) {
+  const commandName = 'WAN 3.0';
+
+  if (interaction.guildId !== DISCORD_GUILD_ID) {
+    await interaction.reply({ content: 'This bot only works in its home server.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const user = interaction.user;
+  const jobId = takeSlot(user.id);
+  if (!jobId) {
+    await interaction.reply({
+      content: `You already have ${runningCount(user.id)} of ${MAX_PER_USER} generations running \u2014 wait for one to finish.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const idRef = { value: null };
+  const startedAt = Date.now();
+  const { finalise, replyToAnchor, setAnchor } = makeAnchorFns({ interaction });
+  const wanSettings = (d, r, res, extra = []) => [`\`${d}s\``, `\`${r}\``, `\`${res}\``, '`audio on`', ...extra].join(' \u2022 ');
+
+  try {
+    const prompt = interaction.options.getString('prompt', true);
+    const duration = interaction.options.getInteger('duration') ?? WAN_DEFAULT_DURATION;
+    const ratio = interaction.options.getString('ratio') ?? WAN_DEFAULT_RATIO;
+    const resolution = interaction.options.getString('resolution') ?? WAN_DEFAULT_RESOLUTION;
+
+    const { images: imgAtts, error: refError } = collectReferences(
+      interaction, ['img1', 'img2', 'img3'], WAN_MAX_IMAGES, [], 0,
+    );
+    if (refError) {
+      await interaction.reply({ content: refError, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const refCount = imgAtts?.length ?? 0;
+
+    await interaction.deferReply();
+
+    const preparing = new EmbedBuilder()
+      .setColor(COLOR_WORKING)
+      .setAuthor({ name: commandName })
+      .setTitle('Preparing your request')
+      .setDescription(`>>> ${truncate(prompt, 900)}`)
+      .addFields({ name: 'Settings', value: wanSettings(duration, ratio, resolution) })
+      .setFooter({ text: `Requested by ${user.username} \u2022 submitting\u2026`, iconURL: user.displayAvatarURL() })
+      .setTimestamp();
+    if (refCount) {
+      preparing.addFields({ name: 'References', value: `${refCount} image${refCount > 1 ? 's' : ''}` });
+      preparing.setThumbnail(imgAtts[0].url);
+    }
+    const anchor = await interaction.editReply({ embeds: [preparing] });
+    setAnchor(anchor);
+
+    const media = [];
+    for (const [i, a] of (imgAtts ?? []).entries()) {
+      media.push(await wan.uploadReference(a, i));
+    }
+    const { taskId } = await wan.createTask({ prompt, duration, ratio, resolution, images: media });
+    idRef.value = taskId;
+
+    try {
+      await jobStore.save({
+        jobId, kind: 'wan', userId: user.id, guildId: interaction.guildId,
+        channelId: interaction.channelId, anchorMessageId: anchor.id,
+        prompt, duration, ratio, resolution, refCount, taskId,
+        deadlineAt: startedAt + VIDEO_TIMEOUT, createdAt: startedAt,
+      });
+    } catch (err) {
+      console.warn(`Could not persist wan job ${jobId}: ${err?.message ?? err}`);
+    }
+
+    const working = new EmbedBuilder()
+      .setColor(COLOR_WORKING)
+      .setAuthor({ name: commandName })
+      .setTitle('Generating your video')
+      .setDescription(`>>> ${truncate(prompt, 900)}`)
+      .addFields({ name: 'Settings', value: wanSettings(duration, ratio, resolution) })
+      .setFooter({ text: `Requested by ${user.username} \u2022 this takes a few minutes`, iconURL: user.displayAvatarURL() })
+      .setTimestamp();
+    if (refCount) {
+      working.addFields({ name: 'References', value: `${refCount} image${refCount > 1 ? 's' : ''}` });
+      working.setThumbnail(imgAtts[0].url);
+    }
+    await finalise(working);
+
+    const { videoUrl } = await wan.waitForTask(taskId, { intervalMs: POLL_MS, timeoutMs: VIDEO_TIMEOUT, onUpdate: () => {} });
+
+    const file = await wan.downloadFile(videoUrl);
+    try {
+      const limit = uploadLimitBytes(interaction.guild);
+      const mb = (file.bytes / MB).toFixed(1);
+
+      const done = new EmbedBuilder()
+        .setColor(COLOR_DONE)
+        .setAuthor({ name: commandName })
+        .setTitle('Your video is ready')
+        .setDescription(`>>> ${truncate(prompt, 900)}`)
+        .addFields(
+          { name: 'Settings', value: wanSettings(duration, ratio, resolution, [`\`${fmtElapsed(Date.now() - startedAt)}\``]) },
+          { name: 'Task ID', value: `\`\`\`${idRef.value ?? ''}\`\`\`` },
+        )
+        .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
+        .setTimestamp();
+      if (refCount) done.addFields({ name: 'References', value: `${refCount} image${refCount > 1 ? 's' : ''}` });
+      await finalise(done);
+
+      if (file.bytes >= limit) {
+        await replyToAnchor({ content: `${user}\nYour video rendered but it's ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
+        console.log(`${idRef.value} (wan) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, over limit)`);
+      } else {
+        await replyToAnchor({ content: `${user}`, files: [new AttachmentBuilder(createReadStream(file.path), { name: 'wan3-video.mp4' })] });
+        console.log(`${idRef.value} (wan) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, attached)`);
+      }
+    } finally {
+      await safeUnlink(file.path);
+    }
+  } catch (err) {
+    try {
+      await handleGenerationError(err, {
+        finalise, replyToAnchor,
+        prompt: interaction.options.getString('prompt') ?? '',
+        user, idRef, commandName, idLabel: 'Task ID',
+      });
+    } catch (fatal) {
+      console.error(`Unhandled error in ${commandName} for ${user.tag}:`, fatal);
+      try {
+        const body = { content: 'Something went wrong starting that generation.' };
+        if (interaction.deferred || interaction.replied) await interaction.editReply(body);
+        else await interaction.reply({ ...body, flags: MessageFlags.Ephemeral });
+      } catch { /* interaction unusable */ }
+    }
+  } finally {
+    releaseSlot(user.id, jobId);
+    await jobStore.remove(jobId);
+  }
+}
+
 // ─── /flux-3 generation handler ──────────────────────────────────────────────
 // Each run spins up a disposable Synthesia account (temp.tf email -> Cognito
 // signup -> email code -> freemium credits), generates FLUX 3, then downloads it.
@@ -1002,7 +1262,7 @@ async function runFluxGeneration(interaction) {
     const anchor = await interaction.editReply({ embeds: [preparing] });
     setAnchor(anchor);
 
-    // Disposable account + workspace + freemium credits. Retry once — signup can
+    // Disposable account + workspace + freemium credits. Retry once â€” signup can
     // transiently fail (temp email allocation / verification code hiccups).
     let session = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -1018,7 +1278,7 @@ async function runFluxGeneration(interaction) {
     const assetId = await flux.generate(session, { prompt, duration, ratio });
     idRef.value = assetId;
 
-    // The generation id now exists — flip the card to "Generating your video".
+    // The generation id now exists â€” flip the card to "Generating your video".
     await finalise(new EmbedBuilder()
       .setColor(COLOR_WORKING)
       .setAuthor({ name: commandName })
@@ -1107,7 +1367,7 @@ async function runFluxGeneration(interaction) {
   }
 }
 
-// ─── Resume after a restart ──────────────────────────────────────────────────
+// â”€â”€â”€ Resume after a restart â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Jobs are persisted the moment the task is submitted, so a crash / OOM-kill /
 // deploy mid-render doesn't lose them: on boot we re-poll each task by its id and
 // deliver the result to the original message.
@@ -1147,8 +1407,10 @@ async function resumeOne(rec) {
 
   if (rec.kind === 'flux') return resumeFlux(rec, { user, prompt, channel, finalise, replyToAnchor });
   if (rec.kind === 'sd2') return resumeSd2(rec, { user, prompt, channel, finalise, replyToAnchor });
+  if (rec.kind === 'autobypass') return resumeAutoBypass(rec, { user, prompt, channel, finalise, replyToAnchor });
+  if (rec.kind === 'wan') return resumeWan(rec, { user, prompt, channel, finalise, replyToAnchor });
 
-  // Unknown / removed provider (e.g. old /wan-3 jobs) — cannot resume; drop it.
+  // Unknown / removed provider (e.g. old /wan-3 jobs) â€” cannot resume; drop it.
   console.warn(`Resume ${rec.jobId}: unsupported kind '${rec.kind ?? 'legacy'}', dropping.`);
   await jobStore.remove(rec.jobId);
 }
@@ -1219,7 +1481,7 @@ async function resumeFlux(rec, { user, prompt, channel, finalise, replyToAnchor 
   }
 }
 
-// ─── Resilience ──────────────────────────────────────────────────────────────
+// â”€â”€â”€ Resilience â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 client.on('error', (err) => console.error('Client error:', err));
 client.on('shardError', (err) => console.error('Shard websocket error:', err));
 client.on('shardDisconnect', (event, id) =>
@@ -1310,6 +1572,72 @@ async function resumeSd2(rec, { user, prompt, channel, finalise, replyToAnchor }
       await handleGenerationError(err, { finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId), idRef, commandName: 'Seedance 2.0', idLabel: 'Task ID' });
     } catch (fatal) {
       console.error(`Resume sd2 ${rec.jobId} delivery failed:`, fatal);
+    }
+  } finally {
+    await jobStore.remove(rec.jobId);
+  }
+}
+
+async function resumeWan(rec, { user, prompt, channel, finalise, replyToAnchor }) {
+  const idRef = { value: rec.taskId };
+  const wanSettings = (d, r, extra = []) => [`\`${d}s\``, `\`${r}\``, '`720p`', '`audio on`', ...extra].join(' \u2022 ');
+  try {
+    const remaining = (rec.deadlineAt ?? 0) - Date.now();
+    if (remaining <= 0) {
+      await handleGenerationError(
+        new WanError(`Generation timed out after ${Math.max(1, Math.round(VIDEO_TIMEOUT / 60_000))} minutes.`, { timedOut: true }),
+        { finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId), idRef, commandName: 'WAN 3.0', idLabel: 'Task ID' },
+      );
+      return;
+    }
+
+    try {
+      await finalise(new EmbedBuilder()
+        .setColor(COLOR_WORKING)
+        .setAuthor({ name: 'WAN 3.0' })
+        .setTitle('Resuming your video')
+        .setDescription(`>>> ${truncate(prompt, 900)}`)
+        .addFields({ name: 'Status', value: 'Picked this back up after a restart \u2014 still working on it.' })
+        .setFooter({ text: user ? `Requested by ${user.username}` : 'Recovered after a restart', iconURL: user?.displayAvatarURL?.() })
+        .setTimestamp());
+    } catch { /* cosmetic */ }
+
+    const { videoUrl } = await wan.waitForTask(rec.taskId, { intervalMs: POLL_MS, timeoutMs: remaining, onUpdate: () => {} });
+
+    const file = await wan.downloadFile(videoUrl);
+    try {
+      const limit = uploadLimitBytes(channel.guild ?? null);
+      const mb = (file.bytes / MB).toFixed(1);
+      const mention = user ? `${user}` : `<@${rec.userId}>`;
+
+      const done = new EmbedBuilder()
+        .setColor(COLOR_DONE)
+        .setAuthor({ name: 'WAN 3.0' })
+        .setTitle('Your video is ready')
+        .setDescription(`>>> ${truncate(prompt, 900)}`)
+        .addFields(
+          { name: 'Settings', value: wanSettings(rec.duration, rec.ratio, rec.resolution ?? '720p', ['`recovered`']) },
+          { name: 'Task ID', value: `\`\`\`${rec.taskId ?? ''}\`\`\`` },
+        )
+        .setFooter({ text: user ? `Requested by ${user.username}` : 'Recovered after a restart', iconURL: user?.displayAvatarURL?.() })
+        .setTimestamp();
+      await finalise(done);
+
+      if (file.bytes >= limit) {
+        await replyToAnchor({ content: `${mention}\nYour video rendered but it's ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
+        console.log(`${rec.taskId} (wan resumed) succeeded (${mb} MB, over limit)`);
+      } else {
+        await replyToAnchor({ content: `${mention}`, files: [new AttachmentBuilder(createReadStream(file.path), { name: 'wan3-video.mp4' })] });
+        console.log(`${rec.taskId} (wan resumed) succeeded (${mb} MB, attached)`);
+      }
+    } finally {
+      await safeUnlink(file.path);
+    }
+  } catch (err) {
+    try {
+      await handleGenerationError(err, { finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId), idRef, commandName: 'WAN 3.0', idLabel: 'Task ID' });
+    } catch (fatal) {
+      console.error(`Resume wan ${rec.jobId} delivery failed:`, fatal);
     }
   } finally {
     await jobStore.remove(rec.jobId);
