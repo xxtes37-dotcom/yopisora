@@ -540,7 +540,7 @@ const AB_COUNT = 4;
 const AB_SUBMIT_CONCURRENCY = 5;
 const AB_DELIVER_CONCURRENCY = 5;
 const AB_DURATION = 15;
-const AB_RESOLUTION = '720p';
+const AB_RESOLUTION = '480p';
 const AB_RATIO = '16:9';
 const AB_PROMPT_TEMPLATE = (userPrompt) =>
   `a X mask hovering in a white void for 0.2 seconds, then at the 0.3 second mark then the video instantly cuts to ${userPrompt} [refrence Video 1 for how long X mask stays on screen when video turns black that's when cut starts]`;
