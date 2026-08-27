@@ -1,12 +1,20 @@
 /**
- * WAN 3.0 video via the self-hosted generation proxy.
+ * WAN 3.0 video via the HappyHorse generation proxy.
  *
  * Async task flow:
- *   1. POST /api/generate  { model, input:{prompt, img_url?}, parameters:{duration, size} } -> task id
+ *   1. POST /api/generate  { model, input:{prompt, media?}, parameters:{duration, resolution} } -> task id
  *   2. GET  /api/status/{task_id}  until task_status SUCCEEDED / FAILED
  *   3. Download the mp4 from output.video_url (a signed OSS URL)
  *
- * 720p is fixed (1280*720 / 720*1280), audio is always on.
+ * Reference images are PUT to /api/oss/happyhorse/{date}/{ts}_{sid}/inputs/image_{i}.{ext}
+ * which returns {"url": ...}; the returned URL rides in input.media as reference_image.
+ *
+ * Verified against the live proxy (all probed with ffprobe on real outputs):
+ *   - parameters.resolution '720P' -> 1280x720 / 720x1280 native (NO super-resolution)
+ *   - parameters.resolution '480P' -> 832x480 native
+ *   - parameters.size must NOT be used — the proxy SR-upscales it to 1080p-class
+ *   - aspect is driven by a prompt suffix: ", 16:9 ratio" / ", 9:16 ratio"
+ *   - model wan3.0-video-prime; outputs carry an AAC audio track (audio on)
  */
 import { createWriteStream } from 'node:fs';
 import { unlink, stat, writeFile } from 'node:fs/promises';
@@ -16,31 +24,30 @@ import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 
-const DEFAULT_BASE_URL = process.env.WAN_BASE_URL || 'http://47.84.12.128:9000';
-const DEFAULT_MODEL = 'wan3.0-video';
+const DEFAULT_BASE_URL = 'http://47.84.12.128:9000';
+const DEFAULT_MODEL = 'wan3.0-video-prime';
 
 export const WAN_MODEL = DEFAULT_MODEL;
 export const WAN_DURATIONS = [5, 10, 15, 20, 25, 30];
 export const WAN_DEFAULT_DURATION = 10;
 export const WAN_RATIOS = ['16:9', '9:16'];
 export const WAN_DEFAULT_RATIO = '16:9';
-export const WAN_RESOLUTIONS = ['480p', '720p'];
-export const WAN_DEFAULT_RESOLUTION = '720p';
+export const WAN_RESOLUTIONS = ['480P', '720P'];
+export const WAN_DEFAULT_RESOLUTION = '720P';
 export const WAN_MAX_IMAGES = 3;
 
-const SIZE_BY_RATIO = {
-  '16:9': { '480p': '864*480', '720p': '1280*720' },
-  '9:16': { '480p': '480*832', '720p': '720*1280' },
-};
-
-const OSS_PUBLIC_BASE = process.env.WAN_OSS_PUBLIC_BASE || 'https://hhtestforintl.oss-ap-southeast-1.aliyuncs.com/happyhorse';
-
-export const DEFAULT_POLL_INTERVAL_MS = 15_000;
+export const DEFAULT_POLL_INTERVAL_MS = 10_000;
 export const DEFAULT_VIDEO_TIMEOUT_MS = 1_200_000; // 20 min
 const REQUEST_TIMEOUT_MS = 45_000;
+const UPLOAD_TIMEOUT_MS = 120_000;
 const MAX_CONSECUTIVE_POLL_FAILURES = 5;
 
-const BLOCK_RE = /sensitive|privacy|real person|policy|violat|prohibit|nsfw|copyright|risk|illegal|moderat|inappropriate/i;
+// Moderation / policy rejections -> amber "blocked" rather than red "error".
+// Covers input+output moderation (IPInfringementSuspect, DataInspectionFailed, etc.)
+const BLOCK_RE = /sensitive|privacy|real person|policy|violat|prohibit|nsfw|copyright|infring\w*|ip\s*infring|risk|illegal|moderat|inappropriate|inspection|green net/i;
+
+// Infra fingerprints that must never surface in a Discord message.
+const SCRUB_RE = /47\.84\.12\.128|happyhorse|hhtestforintl|aliyuncs|dashscope|oss-ap|alibaba|SimpleHTTP|9000/i;
 
 export class WanError extends Error {
   constructor(message, { status, code, body, blocked, timedOut } = {}) {
@@ -56,14 +63,23 @@ export class WanError extends Error {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function userMessage(msg, fallback) {
+  let m = (msg || '').trim();
+  // Strip backend moderation jargon prefixes ("Green net check failed for image (output): ...").
+  m = m.replace(/^green net check failed[^:]*:\s*/i, '');
+  if (!m || m.length > 300) return fallback;
+  if (SCRUB_RE.test(m)) return fallback;
+  return m;
+}
+
 export class WanClient {
   #base;
   #model;
   #fetch;
 
   constructor({ baseUrl, model, fetchImpl } = {}) {
-    this.#base = (baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
-    this.#model = model ?? DEFAULT_MODEL;
+    this.#base = (baseUrl ?? process.env.WAN_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
+    this.#model = model ?? process.env.WAN_MODEL ?? DEFAULT_MODEL;
     this.#fetch = fetchImpl ?? globalThis.fetch;
   }
 
@@ -74,67 +90,67 @@ export class WanClient {
     finally { clearTimeout(timer); }
   }
 
-  // ─── Reference upload ──────────────────────────────────────────────────────
-  // Mirrors the web app: PUT the raw bytes to /api/oss/happyhorse/{date}/{time}_{rand}/inputs/image_{i}.{ext}
-  // then reference the public OSS mirror of that key in input.media.
+  // ─── Reference upload ───────────────────────────────────────────────────────
+  // Mirrors the web app: PUT raw bytes to /api/oss/happyhorse/{date}/{ts}_{sid}/inputs/image_{i}.{ext},
+  // read the public OSS URL back from the JSON response.
   async uploadReference(attachment, index) {
     const url = attachment.url ?? attachment;
     const name = attachment.name || 'image.png';
     const extMatch = name.match(/\.([a-z0-9]{2,5})$/i);
     const ext = (extMatch ? extMatch[1] : 'png').toLowerCase();
 
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 60_000);
     let bytes;
     try {
-      const resp = await this.#fetch(url, { signal: ctrl.signal });
+      const resp = await this.#fetchWithTimeout(url, {}, UPLOAD_TIMEOUT_MS);
       if (!resp.ok) throw new WanError('Could not fetch a reference image.');
       bytes = Buffer.from(await resp.arrayBuffer());
     } catch (err) {
-      clearTimeout(timer);
-      throw err;
+      if (err instanceof WanError) throw err;
+      throw new WanError('Could not fetch a reference image.');
     }
-    clearTimeout(timer);
 
     const now = new Date();
     const pad = (n) => String(n).padStart(2, '0');
     const date = `${now.getUTCFullYear()}-${pad(now.getUTCMonth() + 1)}-${pad(now.getUTCDate())}`;
     const time = `${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
-    const rand = `t${Array.from({ length: 5 }, () => 'abcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 36)]).join('')}`;
-    const key = `${date}/${time}_${rand}/inputs/image_${index}.${ext}`;
+    const sid = Array.from({ length: 6 }, () => 'abcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 36)]).join('');
+    const ossPath = `happyhorse/${date}/${time}_${sid}/inputs/image_${index}.${ext}`;
 
-    const upCtrl = new AbortController();
-    const upTimer = setTimeout(() => upCtrl.abort(), 120_000);
     try {
-      const resp = await this.#fetch(`${this.#base}/api/oss/happyhorse/${key}`, {
+      const resp = await this.#fetchWithTimeout(`${this.#base}/api/oss/${ossPath}`, {
         method: 'PUT',
         headers: { 'Content-Type': attachment.contentType || 'image/png' },
         body: bytes,
-        signal: upCtrl.signal,
-      });
-      if (!resp.ok) {
-        const t = await resp.text().catch(() => '');
-        console.error(`[wan.uploadReference] HTTP ${resp.status}: ${t.slice(0, 300)}`);
-        throw new WanError('Could not upload a reference image.');
+      }, UPLOAD_TIMEOUT_MS);
+      const txt = await resp.text().catch(() => '');
+      let data = null; try { data = JSON.parse(txt); } catch { /* */ }
+      if (!resp.ok || !data?.url) {
+        console.error(`[wan.uploadReference] HTTP ${resp.status}: ${txt.slice(0, 300)}`);
+        throw new WanError('Could not upload a reference image. Please try again.');
       }
+      return data.url;
     } catch (err) {
-      clearTimeout(upTimer);
-      throw err;
+      if (err instanceof WanError) throw err;
+      throw new WanError('Could not upload a reference image. Please try again.');
     }
-    clearTimeout(upTimer);
-
-    return { type: 'reference_image', url: `${OSS_PUBLIC_BASE}/${key}` };
   }
 
-  // ─── Create task ───────────────────────────────────────────────────────────
+  // ─── Create task ────────────────────────────────────────────────────────────
   async createTask({ prompt, duration, ratio, resolution, images = [] }) {
-    const size = SIZE_BY_RATIO[ratio]?.[resolution] ?? SIZE_BY_RATIO[ratio]?.[WAN_DEFAULT_RESOLUTION] ?? '1280*720';
-    const input = { prompt };
-    if (images.length) input.media = images;
+    // Aspect is prompt-driven (the model's ratio handling is otherwise auto/random).
+    const text = `${prompt}, ${ratio} ratio`;
+    const input = { prompt: text };
+    if (images.length) {
+      const media = [];
+      for (const [i, a] of images.entries()) {
+        media.push({ type: 'reference_image', url: await this.uploadReference(a, i) });
+      }
+      input.media = media;
+    }
     const body = {
       model: this.#model,
       input,
-      parameters: { duration, size },
+      parameters: { duration, resolution },
     };
 
     let lastErr = null;
@@ -157,28 +173,24 @@ export class WanClient {
       const txt = await resp.text().catch(() => '');
       let data = null; try { data = JSON.parse(txt); } catch { /* */ }
 
-      const taskId = data?.output?.task_id;
-      if (resp.ok && taskId) return { taskId };
+      if (resp.ok && data?.output?.task_id) return { taskId: data.output.task_id };
 
-      const code = data?.error?.code || data?.code || '';
-      const msg = data?.error?.message || data?.message || '';
-      console.error(`[wan.createTask] HTTP ${resp.status} code=${code}: ${txt.slice(0, 500)}`);
+      const msg = data?.message || data?.error || '';
+      console.error(`[wan.createTask] HTTP ${resp.status}: ${txt.slice(0, 500)}`);
 
       if (resp.status >= 500 || resp.status === 429) {
-        lastErr = new WanError('The generation service is busy right now. Please try again in a minute.', { status: resp.status, code, body: txt, blocked: true });
+        lastErr = new WanError('The generation service is busy right now. Please try again in a minute.', { status: resp.status, body: txt, blocked: true });
         continue;
       }
       throw new WanError(
-        msg && msg.length <= 300 && !BLOCK_RE.test(`${code} ${msg}`)
-          ? msg
-          : 'Could not start video generation. Please try again.',
-        { status: resp.status, code, body: txt, blocked: BLOCK_RE.test(`${code} ${msg}`) },
+        userMessage(msg, 'Could not start video generation. Please try again.'),
+        { status: resp.status, body: txt, blocked: BLOCK_RE.test(String(msg)) },
       );
     }
     throw lastErr ?? new WanError('Could not start video generation. Please try again.');
   }
 
-  // ─── Poll ──────────────────────────────────────────────────────────────────
+  // ─── Poll ───────────────────────────────────────────────────────────────────
   async waitForTask(taskId, { intervalMs = DEFAULT_POLL_INTERVAL_MS, timeoutMs = DEFAULT_VIDEO_TIMEOUT_MS, onUpdate } = {}) {
     const deadline = Date.now() + timeoutMs;
     const timeoutMinutes = Math.max(1, Math.round(timeoutMs / 60_000));
@@ -188,7 +200,7 @@ export class WanClient {
     while (Date.now() < deadline) {
       let resp;
       try {
-        resp = await this.#fetchWithTimeout(`${this.#base}/api/status/${encodeURIComponent(taskId)}`);
+        resp = await this.#fetchWithTimeout(`${this.#base}/api/status/${taskId}`);
       } catch (err) {
         fails += 1;
         console.warn(`[wan.waitForTask] poll request failed (${fails}/${MAX_CONSECUTIVE_POLL_FAILURES}): ${err?.message ?? err}`);
@@ -210,31 +222,27 @@ export class WanClient {
 
       fails = 0;
       const data = await resp.json();
-      const status = data?.output?.task_status;
+      const output = data.output ?? {};
+      const status = output.task_status;
       if (status !== lastStatus) { lastStatus = status; if (onUpdate) onUpdate(status); }
 
       if (status === 'SUCCEEDED') {
-        const url = data.output?.video_url;
+        const url = output.video_url;
         if (!url) throw new WanError('Generation finished but no video URL was returned.', { body: data });
         return { videoUrl: url, raw: data };
       }
       if (status === 'FAILED' || status === 'CANCELED' || status === 'CANCELLED' || status === 'UNKNOWN') {
-        const code = data.output?.code || '';
-        const msg = data.output?.message || `Generation ${String(status).toLowerCase()}.`;
+        const code = output.code || '';
+        const msg = output.message || `Generation ${status}.`;
         console.error(`[wan.waitForTask] ${status} code=${code}: ${msg}`);
-        throw new WanError(
-          msg && msg.length <= 300 && !BLOCK_RE.test(`${code} ${msg}`)
-            ? msg
-            : 'Generation failed. Please try again.',
-          { code, body: data, blocked: BLOCK_RE.test(`${code} ${msg}`) },
-        );
+        throw new WanError(userMessage(msg, 'Generation failed. Please try again.'), { code, body: data, blocked: BLOCK_RE.test(`${code} ${msg}`) });
       }
       await sleep(intervalMs);
     }
     throw new WanError(`Generation timed out after ${timeoutMinutes} minutes.`, { timedOut: true });
   }
 
-  // ─── Download (streamed to disk) ─────────────────────────────────────────────
+  // ─── Download (streamed to disk) ────────────────────────────────────────────
   async downloadFile(url, { timeoutMs = 180_000 } = {}) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -257,4 +265,9 @@ export class WanClient {
       clearTimeout(timer);
     }
   }
+}
+
+export function classifyWanFailure(err) {
+  if (err instanceof WanError) return { blocked: err.blocked, message: err.message };
+  return { blocked: false, message: err?.message || 'An unexpected error occurred.' };
 }

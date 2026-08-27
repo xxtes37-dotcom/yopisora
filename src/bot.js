@@ -33,6 +33,14 @@ import {
   SD2_MAX_IMAGES,
   SD2_MAX_VIDEOS,
 } from './sd2.js';
+import {
+  WanClient,
+  WanError,
+  WAN_DEFAULT_DURATION,
+  WAN_DEFAULT_RATIO,
+  WAN_DEFAULT_RESOLUTION,
+  WAN_MAX_IMAGES,
+} from './wan.js';
 import { createSlotManager } from './slots.js';
 import { createJobStore } from './jobstore.js';
 import { analyzeVideo, trimVideo, AutoBypassError } from './autobypass.js';
@@ -61,6 +69,7 @@ if (!ARK_API_KEY) {
 
 const flux = new FluxClient();
 const sd2 = new Sd2Client();
+const wan = new WanClient();
 const jobStore = createJobStore({ dir: process.env.GEN_JOB_STORE_DIR || './.jobs' });
 
 const safeUnlink = (p) => (p ? unlink(p).catch(() => {}) : Promise.resolve());
@@ -312,6 +321,7 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName === 'flux-3') return runFluxGeneration(interaction);
   if (interaction.commandName === 'sd2') return runSd2Generation(interaction);
+  if (interaction.commandName === 'wan-3') return runWanGeneration(interaction);
   if (interaction.commandName === 'autobypass') return runAutoBypass(interaction);
 });
 
@@ -1078,6 +1088,146 @@ async function runSd2Generation(interaction) {
 }
 
 
+// ─── /wan-3 generation handler (WAN 3.0) ─────────────────────────────────────
+// Resolution rides as parameters.resolution ('480P'/'720P') — native output, no
+// SR upscaling. Aspect is prompt-driven (", 16:9 ratio" suffix). Reference images
+// are uploaded to the proxy's OSS and passed as input.media reference images.
+
+async function runWanGeneration(interaction) {
+  const commandName = 'WAN 3.0';
+
+  if (interaction.guildId !== DISCORD_GUILD_ID) {
+    await interaction.reply({ content: 'This bot only works in its home server.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const user = interaction.user;
+  const jobId = takeSlot(user.id);
+  if (!jobId) {
+    await interaction.reply({
+      content: `You already have ${runningCount(user.id)} of ${MAX_PER_USER} generations running \u2014 wait for one to finish.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const idRef = { value: null };
+  const startedAt = Date.now();
+  const { finalise, replyToAnchor, setAnchor } = makeAnchorFns({ interaction });
+  const wanSettings = (d, r, res, extra = []) => [`\`${d}s\``, `\`${r}\``, `\`${res}\``, '`audio on`', ...extra].join(' \u2022 ');
+
+  try {
+    const prompt = interaction.options.getString('prompt', true);
+    const duration = interaction.options.getInteger('duration') ?? WAN_DEFAULT_DURATION;
+    const ratio = interaction.options.getString('ratio') ?? WAN_DEFAULT_RATIO;
+    const resolution = interaction.options.getString('resolution') ?? WAN_DEFAULT_RESOLUTION;
+
+    const { images: imgAtts, error: refError } = collectReferences(
+      interaction, ['img1', 'img2', 'img3'], WAN_MAX_IMAGES, [], 0,
+    );
+    if (refError) {
+      await interaction.reply({ content: refError, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const refCount = imgAtts?.length ?? 0;
+
+    await interaction.deferReply();
+
+    const preparing = new EmbedBuilder()
+      .setColor(COLOR_WORKING)
+      .setAuthor({ name: commandName })
+      .setTitle('Preparing your request')
+      .setDescription(`>>> ${truncate(prompt, 900)}`)
+      .addFields({ name: 'Settings', value: wanSettings(duration, ratio, resolution) })
+      .setFooter({ text: `Requested by ${user.username} \u2022 submitting\u2026`, iconURL: user.displayAvatarURL() })
+      .setTimestamp();
+    if (refCount) {
+      preparing.addFields({ name: 'References', value: `${refCount} image${refCount > 1 ? 's' : ''}` });
+      preparing.setThumbnail(imgAtts[0].url);
+    }
+    const anchor = await interaction.editReply({ embeds: [preparing] });
+    setAnchor(anchor);
+
+    const { taskId } = await wan.createTask({ prompt, duration, ratio, resolution, images: imgAtts ?? [] });
+    idRef.value = taskId;
+
+    try {
+      await jobStore.save({
+        jobId, kind: 'wan', userId: user.id, guildId: interaction.guildId,
+        channelId: interaction.channelId, anchorMessageId: anchor.id,
+        prompt, duration, ratio, resolution, refCount, taskId,
+        deadlineAt: startedAt + VIDEO_TIMEOUT, createdAt: startedAt,
+      });
+    } catch (err) {
+      console.warn(`Could not persist wan job ${jobId}: ${err?.message ?? err}`);
+    }
+
+    const working = new EmbedBuilder()
+      .setColor(COLOR_WORKING)
+      .setAuthor({ name: commandName })
+      .setTitle('Generating your video')
+      .setDescription(`>>> ${truncate(prompt, 900)}`)
+      .addFields({ name: 'Settings', value: wanSettings(duration, ratio, resolution) })
+      .setFooter({ text: `Requested by ${user.username} \u2022 this takes a few minutes`, iconURL: user.displayAvatarURL() })
+      .setTimestamp();
+    if (refCount) {
+      working.addFields({ name: 'References', value: `${refCount} image${refCount > 1 ? 's' : ''}` });
+      working.setThumbnail(imgAtts[0].url);
+    }
+    await finalise(working);
+
+    const { videoUrl } = await wan.waitForTask(taskId, { intervalMs: POLL_MS, timeoutMs: VIDEO_TIMEOUT, onUpdate: () => {} });
+
+    const file = await wan.downloadFile(videoUrl);
+    try {
+      const limit = uploadLimitBytes(interaction.guild);
+      const mb = (file.bytes / MB).toFixed(1);
+
+      const done = new EmbedBuilder()
+        .setColor(COLOR_DONE)
+        .setAuthor({ name: commandName })
+        .setTitle('Your video is ready')
+        .setDescription(`>>> ${truncate(prompt, 900)}`)
+        .addFields(
+          { name: 'Settings', value: wanSettings(duration, ratio, resolution, [`\`${fmtElapsed(Date.now() - startedAt)}\``]) },
+          { name: 'Task ID', value: `\`\`\`${idRef.value ?? ''}\`\`\`` },
+        )
+        .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
+        .setTimestamp();
+      if (refCount) done.addFields({ name: 'References', value: `${refCount} image${refCount > 1 ? 's' : ''}` });
+      await finalise(done);
+
+      if (file.bytes >= limit) {
+        await replyToAnchor({ content: `${user}\nYour video rendered but it's ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
+        console.log(`${idRef.value} (wan) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, over limit)`);
+      } else {
+        await replyToAnchor({ content: `${user}`, files: [new AttachmentBuilder(createReadStream(file.path), { name: 'wan3-video.mp4' })] });
+        console.log(`${idRef.value} (wan) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, attached)`);
+      }
+    } finally {
+      await safeUnlink(file.path);
+    }
+  } catch (err) {
+    try {
+      await handleGenerationError(err, {
+        finalise, replyToAnchor,
+        prompt: interaction.options.getString('prompt') ?? '',
+        user, idRef, commandName, idLabel: 'Task ID',
+      });
+    } catch (fatal) {
+      console.error(`Unhandled error in ${commandName} for ${user.tag}:`, fatal);
+      try {
+        const body = { content: 'Something went wrong starting that generation.' };
+        if (interaction.deferred || interaction.replied) await interaction.editReply(body);
+        else await interaction.reply({ ...body, flags: MessageFlags.Ephemeral });
+      } catch { /* interaction unusable */ }
+    }
+  } finally {
+    releaseSlot(user.id, jobId);
+    await jobStore.remove(jobId);
+  }
+}
+
 // ─── /flux-3 generation handler ──────────────────────────────────────────────
 // Each run spins up a disposable Synthesia account (temp.tf email -> Cognito
 // signup -> email code -> freemium credits), generates FLUX 3, then downloads it.
@@ -1269,9 +1419,10 @@ async function resumeOne(rec) {
 
   if (rec.kind === 'flux') return resumeFlux(rec, { user, prompt, channel, finalise, replyToAnchor });
   if (rec.kind === 'sd2') return resumeSd2(rec, { user, prompt, channel, finalise, replyToAnchor });
+  if (rec.kind === 'wan') return resumeWan(rec, { user, prompt, channel, finalise, replyToAnchor });
   if (rec.kind === 'autobypass') return resumeAutoBypass(rec, { user, prompt, channel, finalise, replyToAnchor });
 
-  // Unknown / removed provider (e.g. old /wan-3 jobs) â€” cannot resume; drop it.
+  // Unknown / removed provider — cannot resume; drop it.
   console.warn(`Resume ${rec.jobId}: unsupported kind '${rec.kind ?? 'legacy'}', dropping.`);
   await jobStore.remove(rec.jobId);
 }
@@ -1433,6 +1584,73 @@ async function resumeSd2(rec, { user, prompt, channel, finalise, replyToAnchor }
       await handleGenerationError(err, { finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId), idRef, commandName: 'Seedance 2.0', idLabel: 'Task ID' });
     } catch (fatal) {
       console.error(`Resume sd2 ${rec.jobId} delivery failed:`, fatal);
+    }
+  } finally {
+    await jobStore.remove(rec.jobId);
+  }
+}
+
+async function resumeWan(rec, { user, prompt, channel, finalise, replyToAnchor }) {
+  const idRef = { value: rec.taskId };
+  const wanSettings = (d, r, res, extra = []) => [`\`${d}s\``, `\`${r}\``, `\`${res}\``, '`audio on`', ...extra].join(' \u2022 ');
+  try {
+    const remaining = (rec.deadlineAt ?? 0) - Date.now();
+    if (remaining <= 0) {
+      await handleGenerationError(
+        new WanError(`Generation timed out after ${Math.max(1, Math.round(VIDEO_TIMEOUT / 60_000))} minutes.`, { timedOut: true }),
+        { finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId), idRef, commandName: 'WAN 3.0', idLabel: 'Task ID' },
+      );
+      return;
+    }
+
+    try {
+      await finalise(new EmbedBuilder()
+        .setColor(COLOR_WORKING)
+        .setAuthor({ name: 'WAN 3.0' })
+        .setTitle('Resuming your video')
+        .setDescription(`>>> ${truncate(prompt, 900)}`)
+        .addFields({ name: 'Status', value: 'Picked this back up after a restart \u2014 still working on it.' })
+        .setFooter({ text: user ? `Requested by ${user.username}` : 'Recovered after a restart', iconURL: user?.displayAvatarURL?.() })
+        .setTimestamp());
+    } catch { /* cosmetic */ }
+
+    const { videoUrl } = await wan.waitForTask(rec.taskId, { intervalMs: POLL_MS, timeoutMs: remaining, onUpdate: () => {} });
+
+    const file = await wan.downloadFile(videoUrl);
+    try {
+      const limit = uploadLimitBytes(channel.guild ?? null);
+      const mb = (file.bytes / MB).toFixed(1);
+      const mention = user ? `${user}` : `<@${rec.userId}>`;
+
+      const done = new EmbedBuilder()
+        .setColor(COLOR_DONE)
+        .setAuthor({ name: 'WAN 3.0' })
+        .setTitle('Your video is ready')
+        .setDescription(`>>> ${truncate(prompt, 900)}`)
+        .addFields(
+          { name: 'Settings', value: wanSettings(rec.duration, rec.ratio, rec.resolution, ['`recovered`']) },
+          { name: 'Task ID', value: `\`\`\`${rec.taskId ?? ''}\`\`\`` },
+        )
+        .setFooter({ text: user ? `Requested by ${user.username}` : 'Recovered after a restart', iconURL: user?.displayAvatarURL?.() })
+        .setTimestamp();
+      if (rec.refCount) done.addFields({ name: 'References', value: `${rec.refCount} image${rec.refCount > 1 ? 's' : ''}` });
+      await finalise(done);
+
+      if (file.bytes >= limit) {
+        await replyToAnchor({ content: `${mention}\nYour video rendered but it's ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
+        console.log(`${rec.taskId} (wan resumed) succeeded (${mb} MB, over limit)`);
+      } else {
+        await replyToAnchor({ content: `${mention}`, files: [new AttachmentBuilder(createReadStream(file.path), { name: 'wan3-video.mp4' })] });
+        console.log(`${rec.taskId} (wan resumed) succeeded (${mb} MB, attached)`);
+      }
+    } finally {
+      await safeUnlink(file.path);
+    }
+  } catch (err) {
+    try {
+      await handleGenerationError(err, { finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId), idRef, commandName: 'WAN 3.0', idLabel: 'Task ID' });
+    } catch (fatal) {
+      console.error(`Resume wan ${rec.jobId} delivery failed:`, fatal);
     }
   } finally {
     await jobStore.remove(rec.jobId);

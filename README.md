@@ -1,6 +1,6 @@
 # Yopisora — video bot
 
-A single-server Discord bot: `/flux-3`, `/sd2` and `/autobypass`.
+A single-server Discord bot: `/flux-3`, `/sd2`, `/wan-3` and `/autobypass`.
 
 ## Commands
 
@@ -16,6 +16,16 @@ A single-server Discord bot: `/flux-3`, `/sd2` and `/autobypass`.
 - `ratio` — 16:9 (default), 9:16, 21:9, 4:3
 - `img1`–`img3` — optional reference images
 - `vid1` — optional reference video
+
+`/wan-3` — WAN 3.0
+- `prompt` (required)
+- `duration` — 5, 10 (default), 15, 20, 25, 30 seconds
+- `ratio` — 16:9 (default), 9:16
+- `resolution` — 480P (832x480 / 480x832), 720P (1280x720 / 720x1280, default) —
+  native output, no upscaling
+- `img1`–`img3` — optional reference images (passed as reference images, not a
+  first frame)
+- Audio is always on.
 
 `/autobypass` — fires 4 Seedance 2.0 renders (15s • 16:9 • 480p) of the prompt
 template with `videointro.mov` attached as the reference video, waits for every
