@@ -1178,9 +1178,22 @@ async function runWanGeneration(interaction) {
 
     const { videoUrl } = await wan.waitForTask(taskId, { intervalMs: POLL_MS, timeoutMs: VIDEO_TIMEOUT, onUpdate: () => {} });
 
-    const file = await wan.downloadFile(videoUrl);
+    const limit = uploadLimitBytes(interaction.guild);
+    // Compress slightly if the render is over the server upload limit so it
+    // still attaches instead of bouncing (99% of limit -> re-encode to 98%).
+    const overBytes = Math.round(limit * 0.99);
+    const targetBytes = Math.round(limit * 0.98);
+    let compressed = false;
+    let file = await wan.downloadFile(videoUrl);
+    if (file.bytes > overBytes) {
+      try {
+        file = await wan.compressToFit(file, targetBytes);
+        compressed = true;
+      } catch (err) {
+        console.error(`[wan] compression failed (${err?.message ?? err}) — falling back to over-limit notice`);
+      }
+    }
     try {
-      const limit = uploadLimitBytes(interaction.guild);
       const mb = (file.bytes / MB).toFixed(1);
 
       const done = new EmbedBuilder()
@@ -1189,7 +1202,7 @@ async function runWanGeneration(interaction) {
         .setTitle('Your video is ready')
         .setDescription(`>>> ${truncate(prompt, 900)}`)
         .addFields(
-          { name: 'Settings', value: wanSettings(duration, ratio, resolution, [`\`${fmtElapsed(Date.now() - startedAt)}\``]) },
+          { name: 'Settings', value: wanSettings(duration, ratio, resolution, [`\`${fmtElapsed(Date.now() - startedAt)}\``, ...(compressed ? ['`compressed`'] : [])]) },
           { name: 'Task ID', value: `\`\`\`${idRef.value ?? ''}\`\`\`` },
         )
         .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
@@ -1202,7 +1215,7 @@ async function runWanGeneration(interaction) {
         console.log(`${idRef.value} (wan) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, over limit)`);
       } else {
         await replyToAnchor({ content: `${user}`, files: [new AttachmentBuilder(createReadStream(file.path), { name: 'wan3-video.mp4' })] });
-        console.log(`${idRef.value} (wan) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, attached)`);
+        console.log(`${idRef.value} (wan) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, attached${compressed ? ', compressed' : ''})`);
       }
     } finally {
       await safeUnlink(file.path);
@@ -1616,9 +1629,20 @@ async function resumeWan(rec, { user, prompt, channel, finalise, replyToAnchor }
 
     const { videoUrl } = await wan.waitForTask(rec.taskId, { intervalMs: POLL_MS, timeoutMs: remaining, onUpdate: () => {} });
 
-    const file = await wan.downloadFile(videoUrl);
+    const limit = uploadLimitBytes(channel.guild ?? null);
+    const overBytes = Math.round(limit * 0.99);
+    const targetBytes = Math.round(limit * 0.98);
+    let compressed = false;
+    let file = await wan.downloadFile(videoUrl);
+    if (file.bytes > overBytes) {
+      try {
+        file = await wan.compressToFit(file, targetBytes);
+        compressed = true;
+      } catch (err) {
+        console.error(`[wan] compression failed on resume (${err?.message ?? err})`);
+      }
+    }
     try {
-      const limit = uploadLimitBytes(channel.guild ?? null);
       const mb = (file.bytes / MB).toFixed(1);
       const mention = user ? `${user}` : `<@${rec.userId}>`;
 
@@ -1628,7 +1652,7 @@ async function resumeWan(rec, { user, prompt, channel, finalise, replyToAnchor }
         .setTitle('Your video is ready')
         .setDescription(`>>> ${truncate(prompt, 900)}`)
         .addFields(
-          { name: 'Settings', value: wanSettings(rec.duration, rec.ratio, rec.resolution, ['`recovered`']) },
+          { name: 'Settings', value: wanSettings(rec.duration, rec.ratio, rec.resolution, ['`recovered`', ...(compressed ? ['`compressed`'] : [])]) },
           { name: 'Task ID', value: `\`\`\`${rec.taskId ?? ''}\`\`\`` },
         )
         .setFooter({ text: user ? `Requested by ${user.username}` : 'Recovered after a restart', iconURL: user?.displayAvatarURL?.() })
@@ -1641,7 +1665,7 @@ async function resumeWan(rec, { user, prompt, channel, finalise, replyToAnchor }
         console.log(`${rec.taskId} (wan resumed) succeeded (${mb} MB, over limit)`);
       } else {
         await replyToAnchor({ content: `${mention}`, files: [new AttachmentBuilder(createReadStream(file.path), { name: 'wan3-video.mp4' })] });
-        console.log(`${rec.taskId} (wan resumed) succeeded (${mb} MB, attached)`);
+        console.log(`${rec.taskId} (wan resumed) succeeded (${mb} MB, attached${compressed ? ', compressed' : ''})`);
       }
     } finally {
       await safeUnlink(file.path);

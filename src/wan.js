@@ -21,8 +21,14 @@ import { unlink, stat, writeFile } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { randomBytes } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import os from 'node:os';
 import path from 'node:path';
+import staticFFmpeg from 'ffmpeg-static';
+
+const pExecFile = promisify(execFile);
+const FFMPEG_BIN = process.env.FFMPEG_PATH || staticFFmpeg || 'ffmpeg';
 
 const DEFAULT_BASE_URL = 'http://47.84.12.128:9000';
 const DEFAULT_MODEL = 'wan3.0-video-prime';
@@ -41,6 +47,7 @@ export const DEFAULT_VIDEO_TIMEOUT_MS = 1_200_000; // 20 min
 const REQUEST_TIMEOUT_MS = 45_000;
 const UPLOAD_TIMEOUT_MS = 120_000;
 const MAX_CONSECUTIVE_POLL_FAILURES = 5;
+const MB = 1024 * 1024;
 
 // Moderation / policy rejections -> amber "blocked" rather than red "error".
 // Covers input+output moderation (IPInfringementSuspect, DataInspectionFailed, etc.)
@@ -62,6 +69,27 @@ export class WanError extends Error {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function ffRun(args, { timeoutMs = 300_000 } = {}) {
+  try {
+    return await pExecFile(FFMPEG_BIN, args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 });
+  } catch (err) {
+    throw new WanError(`ffmpeg step failed: ${err?.message ?? err}`);
+  }
+}
+
+async function videoDurationSeconds(file) {
+  // ffmpeg exits non-zero with no output target but still prints the header —
+  // no decode needed.
+  try {
+    await pExecFile(FFMPEG_BIN, ['-hide_banner', '-nostats', '-i', file], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 });
+  } catch (err) {
+    const stderr = String(err?.stderr ?? '');
+    const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/);
+    if (m) return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) + Number(`0.${m[4]}`);
+  }
+  return null;
+}
 
 function userMessage(msg, fallback) {
   let m = (msg || '').trim();
@@ -263,6 +291,51 @@ export class WanClient {
       throw err;
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  // ─── Compress to a target size ──────────────────────────────────────────────
+  // Re-encodes at a bitrate computed from the duration so the result lands under
+  // targetBytes. Retries once with a scaled-down bitrate if the first pass
+  // overshoots. The input file is unlinked on success.
+  async compressToFit(file, targetBytes) {
+    const duration = await videoDurationSeconds(file.path);
+    if (!duration || duration <= 0) throw new WanError('Could not measure the video duration.');
+
+    const AUDIO_KBPS = 128;
+    const target = async (videoKbps, outPath) => {
+      const args = [
+        '-y', '-hide_banner', '-nostats',
+        '-i', file.path,
+        '-c:v', 'libx264', '-preset', 'veryfast',
+        '-b:v', `${videoKbps}k`,
+        '-maxrate', `${Math.round(videoKbps * 1.4)}k`,
+        '-bufsize', `${Math.round(videoKbps * 3)}k`,
+        '-c:a', 'aac', '-b:a', `${AUDIO_KBPS}k`,
+        '-movflags', '+faststart',
+        outPath,
+      ];
+      await ffRun(args, { timeoutMs: 600_000 });
+      const { size } = await stat(outPath);
+      return size;
+    };
+
+    let videoKbps = Math.max(500, Math.floor((targetBytes * 8) / 1000 / duration) - AUDIO_KBPS);
+    const outPath = path.join(os.tmpdir(), `wan-c-${randomBytes(8).toString('hex')}.mp4`);
+    try {
+      let bytes = await target(videoKbps, outPath);
+      if (bytes > targetBytes) {
+        videoKbps = Math.max(300, Math.floor(videoKbps * (targetBytes / bytes) * 0.95));
+        await unlink(outPath).catch(() => {});
+        bytes = await target(videoKbps, outPath);
+      }
+      if (bytes > targetBytes) throw new WanError('Could not compress the video under the upload limit.');
+      await unlink(file.path).catch(() => {});
+      console.log(`[wan.compressToFit] ${(file.bytes / MB).toFixed(1)} MB -> ${(bytes / MB).toFixed(1)} MB (@${videoKbps}k)`);
+      return { path: outPath, bytes, contentType: 'video/mp4' };
+    } catch (err) {
+      await unlink(outPath).catch(() => {});
+      throw err;
     }
   }
 }
