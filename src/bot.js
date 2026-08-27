@@ -74,6 +74,13 @@ const jobStore = createJobStore({ dir: process.env.GEN_JOB_STORE_DIR || './.jobs
 
 const safeUnlink = (p) => (p ? unlink(p).catch(() => {}) : Promise.resolve());
 
+// Terminal-outcome tombstone: written the instant a job's user-facing outcome
+// lands (video sent, over-limit notice, or error shown). If the process dies
+// between that moment and the job-store cleanup, boot-resume sees the flag and
+// drops the record instead of delivering a second copy of the video.
+const markJobDelivered = (jobId) =>
+  jobStore.save({ jobId, kind: 'wan', delivered: true, deliveredAt: Date.now() }).catch(() => {});
+
 const POLL_MS = Number(GEN_POLL_INTERVAL_MS);
 const VIDEO_TIMEOUT = Number(GEN_VIDEO_TIMEOUT_MS);
 const MAX_PER_USER = Number(GEN_MAX_CONCURRENT_PER_USER);
@@ -191,11 +198,36 @@ function makeAnchorFns({ interaction = null, channel = null } = {}) {
 
   const setAnchor = (msg) => { anchor = msg; };
 
+  // Before falling back to a channel send after a failed anchor reply, check
+  // whether the first attempt actually landed (the send can throw on a network
+  // blip even though Discord accepted the message) — otherwise the video gets
+  // delivered twice.
+  const alreadyDelivered = async () => {
+    if (!anchor) return false;
+    const ch = await resolveChannel();
+    if (!ch?.messages?.fetch) return false;
+    try {
+      const msgs = await ch.messages.fetch({ limit: 10 });
+      return msgs.some((m) =>
+        m.author?.id === client.user?.id
+        && m.reference?.messageId === anchor.id
+        && (m.attachments?.size ?? 0) > 0);
+    } catch { return false; }
+  };
+
   const replyToAnchor = async (body) => {
+    const hasFiles = Boolean(body?.files?.length);
     try { if (anchor) { await anchor.reply(body); return; } }
-    catch (err) { console.warn(`Could not reply to anchor: ${err.message}`); }
+    catch (err) {
+      console.warn(`Could not reply to anchor: ${err.message}`);
+      if (hasFiles && await alreadyDelivered()) {
+        console.log('Delivery already landed despite the error — not sending again.');
+        return;
+      }
+    }
     try {
       const ch = await resolveChannel();
+      if (hasFiles && await alreadyDelivered()) return;
       await ch?.send(body);
     } catch (err) { console.error(`Could not deliver result: ${err.message}`); }
   };
@@ -1212,9 +1244,11 @@ async function runWanGeneration(interaction) {
 
       if (file.bytes >= limit) {
         await replyToAnchor({ content: `${user}\nYour video rendered but it's ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
+        await markJobDelivered(jobId);
         console.log(`${idRef.value} (wan) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, over limit)`);
       } else {
         await replyToAnchor({ content: `${user}`, files: [new AttachmentBuilder(createReadStream(file.path), { name: 'wan3-video.mp4' })] });
+        await markJobDelivered(jobId);
         console.log(`${idRef.value} (wan) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, attached${compressed ? ', compressed' : ''})`);
       }
     } finally {
@@ -1227,6 +1261,7 @@ async function runWanGeneration(interaction) {
         prompt: interaction.options.getString('prompt') ?? '',
         user, idRef, commandName, idLabel: 'Task ID',
       });
+      await markJobDelivered(jobId);
     } catch (fatal) {
       console.error(`Unhandled error in ${commandName} for ${user.tag}:`, fatal);
       try {
@@ -1429,6 +1464,14 @@ async function resumeOne(rec) {
   const prompt = rec.prompt ?? '';
   const { finalise, replyToAnchor, setAnchor } = makeAnchorFns({ channel });
   setAnchor(anchor);
+
+  // The outcome already reached the user before a previous shutdown — never
+  // deliver a second copy.
+  if (rec.delivered) {
+    console.log(`Resume ${rec.jobId}: already delivered before the restart; dropping.`);
+    await jobStore.remove(rec.jobId);
+    return;
+  }
 
   if (rec.kind === 'flux') return resumeFlux(rec, { user, prompt, channel, finalise, replyToAnchor });
   if (rec.kind === 'sd2') return resumeSd2(rec, { user, prompt, channel, finalise, replyToAnchor });
@@ -1662,9 +1705,11 @@ async function resumeWan(rec, { user, prompt, channel, finalise, replyToAnchor }
 
       if (file.bytes >= limit) {
         await replyToAnchor({ content: `${mention}\nYour video rendered but it's ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
+        await markJobDelivered(rec.jobId);
         console.log(`${rec.taskId} (wan resumed) succeeded (${mb} MB, over limit)`);
       } else {
         await replyToAnchor({ content: `${mention}`, files: [new AttachmentBuilder(createReadStream(file.path), { name: 'wan3-video.mp4' })] });
+        await markJobDelivered(rec.jobId);
         console.log(`${rec.taskId} (wan resumed) succeeded (${mb} MB, attached${compressed ? ', compressed' : ''})`);
       }
     } finally {
@@ -1673,6 +1718,7 @@ async function resumeWan(rec, { user, prompt, channel, finalise, replyToAnchor }
   } catch (err) {
     try {
       await handleGenerationError(err, { finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId), idRef, commandName: 'WAN 3.0', idLabel: 'Task ID' });
+      await markJobDelivered(rec.jobId);
     } catch (fatal) {
       console.error(`Resume wan ${rec.jobId} delivery failed:`, fatal);
     }
