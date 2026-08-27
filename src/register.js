@@ -1,5 +1,5 @@
 /**
- * Registers the /flux-3, /sd2, /wan-3 and /autobypass slash commands with Discord.
+ * Registers the /flux-3, /sd2, /sd2-5 and /wan-3 slash commands with Discord.
  * Run once after setup, and again whenever the options below change:
  *   npm run register
  */
@@ -20,6 +20,16 @@ import {
   SD2_DEFAULT_RATIO,
   SD2_MAX_IMAGES,
   SD2_MAX_VIDEOS,
+} from './sd2.js';
+import {
+  SD25_DURATIONS,
+  SD25_DEFAULT_DURATION,
+  SD25_RESOLUTIONS,
+  SD25_DEFAULT_RESOLUTION,
+  SD25_RATIOS,
+  SD25_DEFAULT_RATIO,
+  SD25_MAX_IMAGES,
+  SD25_MAX_VIDEOS,
 } from './sd2.js';
 import {
   WAN_DURATIONS,
@@ -62,9 +72,8 @@ const flux3Builder = new SlashCommandBuilder()
   );
 
 /**
- * /sd2 \u2014 Seedance 2.0 video via Volcengine ARK.
- * prompt, duration (5/10/15s), resolution (480p/720p), ratio (16:9/9:16/21:9/4:3),
- * up to 3 reference images and 1 reference video.
+ * /sd2 \u2014 Seedance 2.0 video with optional reference images / video.
+ * prompt, duration (5/10/15s), resolution (480p/720p), ratio (16:9 / 9:16).
  */
 const sd2Builder = new SlashCommandBuilder()
   .setName('sd2')
@@ -90,20 +99,32 @@ const sd2Builder = new SlashCommandBuilder()
   .addAttachmentOption((o) => o.setName('vid1').setDescription(`Reference video \u2014 MP4/MOV (optional, up to ${SD2_MAX_VIDEOS})`));
 
 /**
- * /autobypass \u2014 fires 4 Seedance 2.0 renders with the intro clip as the
- * reference video, waits for all of them, then judges with ffmpeg which render
- * has the least intro and delivers that one trimmed to the scene.
- * 15s \u2022 16:9 \u2022 720p, no user references.
+ * /sd2-5 \u2014 Seedance 2.5 video with reference images / video.
+ * prompt, duration (5-30s), ratio (16:9 / 9:16 / 21:9), resolution (480p/720p),
+ * up to 3 reference images and 1 reference video (passed as references).
  */
-const autobypassBuilder = new SlashCommandBuilder()
-  .setName('autobypass')
-  .setDescription('Fire 4 renders of your prompt and deliver the cleanest one, intro trimmed')
+const sd25Builder = new SlashCommandBuilder()
+  .setName('sd2-5')
+  .setDescription('Generate a video with Seedance 2.5')
   .addStringOption((o) =>
-    o.setName('prompt').setDescription('The scene the video should cut to after the intro').setRequired(true).setMaxLength(3000),
+    o.setName('prompt').setDescription('What should the video show?').setRequired(true).setMaxLength(4000),
   )
-  .addAttachmentOption((o) => o.setName('img1').setDescription(`Reference image (optional, up to 3) \u2014 passed as a reference, not a first frame`))
+  .addIntegerOption((o) =>
+    o.setName('duration').setDescription(`Length in seconds (default ${SD25_DEFAULT_DURATION})`)
+      .addChoices(...SD25_DURATIONS.map((d) => ({ name: `${d}s${d === SD25_DEFAULT_DURATION ? ' (default)' : ''}`, value: d }))),
+  )
+  .addStringOption((o) =>
+    o.setName('resolution').setDescription(`Output resolution (default ${SD25_DEFAULT_RESOLUTION})`)
+      .addChoices(...SD25_RESOLUTIONS.map((r) => ({ name: r === SD25_DEFAULT_RESOLUTION ? `${r} (default)` : r, value: r }))),
+  )
+  .addStringOption((o) =>
+    o.setName('ratio').setDescription(`Aspect ratio (default ${SD25_DEFAULT_RATIO})`)
+      .addChoices(...SD25_RATIOS.map((r) => ({ name: r === SD25_DEFAULT_RATIO ? `${r} (default)` : r, value: r }))),
+  )
+  .addAttachmentOption((o) => o.setName('img1').setDescription(`Reference image (optional, up to ${SD25_MAX_IMAGES})`))
   .addAttachmentOption((o) => o.setName('img2').setDescription('A second reference image (optional)'))
-  .addAttachmentOption((o) => o.setName('img3').setDescription('A third reference image (optional)'));
+  .addAttachmentOption((o) => o.setName('img3').setDescription('A third reference image (optional)'))
+  .addAttachmentOption((o) => o.setName('vid1').setDescription(`Reference video \u2014 MP4/MOV (optional, up to ${SD25_MAX_VIDEOS})`));
 
 /**
  * /wan-3 \u2014 WAN 3.0 video. Resolution is native (480P -> 832x480, 720P -> 1280x720).
@@ -136,7 +157,7 @@ const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 const route = Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID);
 
 try {
-  const data = await rest.put(route, { body: [flux3Builder.toJSON(), sd2Builder.toJSON(), wan3Builder.toJSON(), autobypassBuilder.toJSON()] });
+  const data = await rest.put(route, { body: [flux3Builder.toJSON(), sd2Builder.toJSON(), sd25Builder.toJSON(), wan3Builder.toJSON()] });
   console.log(`Registered ${data.length} command(s) in server ${DISCORD_GUILD_ID}:`);
   for (const c of data) {
     console.log(`  /${c.name} \u2014 ${c.description}`);

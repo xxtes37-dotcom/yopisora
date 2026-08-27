@@ -54,7 +54,7 @@ const MB = 1024 * 1024;
 const BLOCK_RE = /sensitive|privacy|real person|policy|violat|prohibit|nsfw|copyright|infring\w*|ip\s*infring|risk|illegal|moderat|inappropriate|inspection|green net/i;
 
 // Infra fingerprints that must never surface in a Discord message.
-const SCRUB_RE = /47\.84\.12\.128|happyhorse|hhtestforintl|aliyuncs|dashscope|oss-ap|alibaba|SimpleHTTP|9000/i;
+const SCRUB_RE = /47\.84\.12\.128|happyhorse|hhtestforintl|aliyuncs|dashscope|oss-ap|alibaba|SimpleHTTP|9000|amerie|byteplus|69\.5\.8\.219/i;
 
 export class WanError extends Error {
   constructor(message, { status, code, body, blocked, timedOut } = {}) {

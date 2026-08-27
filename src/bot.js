@@ -14,8 +14,6 @@ import {
 } from 'discord.js';
 import { createReadStream } from 'node:fs';
 import { unlink } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
-import { join, dirname } from 'node:path';
 import {
   FluxClient,
   FluxError,
@@ -25,13 +23,20 @@ import {
   FLUX_DEFAULT_RATIO,
 } from './flux.js';
 import {
-  Sd2Client,
+  SeedanceClient,
   Sd2Error,
+  SD2_MODEL,
   SD2_DEFAULT_DURATION,
   SD2_DEFAULT_RESOLUTION,
   SD2_DEFAULT_RATIO,
   SD2_MAX_IMAGES,
   SD2_MAX_VIDEOS,
+  SD25_MODEL,
+  SD25_DEFAULT_DURATION,
+  SD25_DEFAULT_RESOLUTION,
+  SD25_DEFAULT_RATIO,
+  SD25_MAX_IMAGES,
+  SD25_MAX_VIDEOS,
 } from './sd2.js';
 import {
   WanClient,
@@ -43,12 +48,10 @@ import {
 } from './wan.js';
 import { createSlotManager } from './slots.js';
 import { createJobStore } from './jobstore.js';
-import { analyzeVideo, trimVideo, AutoBypassError } from './autobypass.js';
 
 const {
   DISCORD_TOKEN,
   DISCORD_GUILD_ID,
-  ARK_API_KEY,
   GEN_POLL_INTERVAL_MS = '15000',
   GEN_VIDEO_TIMEOUT_MS = '1200000',
   GEN_MAX_CONCURRENT_PER_USER = '3',
@@ -62,13 +65,10 @@ if (!DISCORD_GUILD_ID) {
   console.error('DISCORD_GUILD_ID is missing. The bot is restricted to a single server.');
   process.exit(1);
 }
-if (!ARK_API_KEY) {
-  console.error('ARK_API_KEY is missing. Fill it in .env (required for /sd2).');
-  process.exit(1);
-}
 
 const flux = new FluxClient();
-const sd2 = new Sd2Client();
+const sd2 = new SeedanceClient({ model: SD2_MODEL });
+const sd25 = new SeedanceClient({ model: SD25_MODEL });
 const wan = new WanClient();
 const jobStore = createJobStore({ dir: process.env.GEN_JOB_STORE_DIR || './.jobs' });
 
@@ -78,8 +78,8 @@ const safeUnlink = (p) => (p ? unlink(p).catch(() => {}) : Promise.resolve());
 // lands (video sent, over-limit notice, or error shown). If the process dies
 // between that moment and the job-store cleanup, boot-resume sees the flag and
 // drops the record instead of delivering a second copy of the video.
-const markJobDelivered = (jobId) =>
-  jobStore.save({ jobId, kind: 'wan', delivered: true, deliveredAt: Date.now() }).catch(() => {});
+const markJobDelivered = (jobId, kind = 'wan') =>
+  jobStore.save({ jobId, kind, delivered: true, deliveredAt: Date.now() }).catch(() => {});
 
 const POLL_MS = Number(GEN_POLL_INTERVAL_MS);
 const VIDEO_TIMEOUT = Number(GEN_VIDEO_TIMEOUT_MS);
@@ -353,8 +353,8 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName === 'flux-3') return runFluxGeneration(interaction);
   if (interaction.commandName === 'sd2') return runSd2Generation(interaction);
+  if (interaction.commandName === 'sd2-5') return runSd25Generation(interaction);
   if (interaction.commandName === 'wan-3') return runWanGeneration(interaction);
-  if (interaction.commandName === 'autobypass') return runAutoBypass(interaction);
 });
 
 // â”€â”€â”€ /sd2 multi-fire (user 1242996784301740032 only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -367,7 +367,7 @@ async function promptSd2Multi(interaction) {
   const resolution = interaction.options.getString('resolution') ?? SD2_DEFAULT_RESOLUTION;
   const ratio = interaction.options.getString('ratio') ?? SD2_DEFAULT_RATIO;
 
-  const { images: imgAtts, videos: vidAtts, references, error: refError } = collectReferences(
+  const { images: imgAtts, videos: vidAtts, error: refError } = collectReferences(
     interaction, ['img1', 'img2', 'img3'], SD2_MAX_IMAGES, ['vid1'], SD2_MAX_VIDEOS,
   );
   if (refError) {
@@ -380,10 +380,8 @@ async function promptSd2Multi(interaction) {
     duration,
     resolution,
     ratio,
-    references,
-    imgThumb: imgAtts[0]?.url ?? null,
-    imgCount: imgAtts.length,
-    vidCount: vidAtts.length,
+    refImages: imgAtts ?? [],
+    refVideos: vidAtts ?? [],
     guildId: interaction.guildId,
     channelId: interaction.channelId,
     expiresAt: Date.now() + SD2_MULTI_PENDING_TTL_MS,
@@ -437,9 +435,9 @@ async function handleSd2MultiModal(interaction) {
   }
 
   const commandName = 'Seedance 2.0';
-  const { prompt, duration, resolution, ratio, references } = pending;
-  const refCount = pending.imgCount + pending.vidCount;
-  const sd2Settings = (d, rt, res, extra = []) => [`\`${d}s\``, `\`${rt}\``, `\`${res}\``, ...extra].join(' â€¢ ');
+  const { prompt, duration, resolution, ratio, refImages, refVideos } = pending;
+  const refCount = (refImages?.length ?? 0) + (refVideos?.length ?? 0);
+  const sd2Settings = (d, rt, res, extra = []) => [`\`${d}s\``, `\`${rt}\``, `\`${res}\``, ...extra].join(' \u2022 ');
 
   await interaction.deferReply();
 
@@ -449,15 +447,15 @@ async function handleSd2MultiModal(interaction) {
     .setTitle(`Firing ${count} generation${count === 1 ? '' : 's'}`)
     .setDescription(`>>> ${truncate(prompt, 900)}`)
     .addFields({ name: 'Settings', value: sd2Settings(duration, ratio, resolution) })
-    .setFooter({ text: `Requested by ${user.username} â€¢ submittingâ€¦`, iconURL: user.displayAvatarURL() })
+    .setFooter({ text: `Requested by ${user.username} \u2022 submitting\u2026`, iconURL: user.displayAvatarURL() })
     .setTimestamp();
   if (refCount) {
     const refSummary = [
-      pending.imgCount ? `${pending.imgCount} image${pending.imgCount > 1 ? 's' : ''}` : null,
-      pending.vidCount ? `${pending.vidCount} video${pending.vidCount > 1 ? 's' : ''}` : null,
+      refImages.length ? `${refImages.length} image${refImages.length > 1 ? 's' : ''}` : null,
+      refVideos.length ? `${refVideos.length} video${refVideos.length > 1 ? 's' : ''}` : null,
     ].filter(Boolean).join(', ');
     firing.addFields({ name: 'References', value: refSummary });
-    if (pending.imgThumb) firing.setThumbnail(pending.imgThumb);
+    if (refImages.length) firing.setThumbnail(refImages[0].url);
   }
 
   const { finalise, replyToAnchor, setAnchor } = makeAnchorFns({ interaction });
@@ -469,7 +467,10 @@ async function handleSd2MultiModal(interaction) {
 
   await runPool(count, SD2_MULTI_SUBMIT_CONCURRENCY, async (i) => {
     try {
-      const { taskId } = await sd2.createTask({ prompt, duration, resolution, ratio, references });
+      const { taskId } = await sd2.createTask({
+        prompt, duration, resolution, ratio,
+        images: refImages ?? [], videos: refVideos ?? [],
+      });
       const jobId = takeSlot(user.id);
       submitted.push({ i, taskId, jobId });
       if (jobId) {
@@ -477,7 +478,8 @@ async function handleSd2MultiModal(interaction) {
           await jobStore.save({
             jobId, kind: 'sd2', userId: user.id, guildId: interaction.guildId,
             channelId: interaction.channelId, anchorMessageId: anchor.id,
-            prompt, duration, ratio, resolution, refCount, taskId,
+            prompt, duration, ratio, resolution,
+            refImages: refImages?.length ?? 0, refVideos: refVideos?.length ?? 0, taskId,
             deadlineAt: Date.now() + VIDEO_TIMEOUT, createdAt: Date.now(),
           });
         } catch (err) {
@@ -499,11 +501,11 @@ async function handleSd2MultiModal(interaction) {
       name: 'Status',
       value: submitted.length
         ? `Submitted ${submitted.length} of ${count}. Waiting on the renders.`
-        : 'Every submit failed â€” nothing is running.',
+        : 'Every submit failed \u2014 nothing is running.',
     })
     .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
     .setTimestamp();
-  if (refCount && pending.imgThumb) live.setThumbnail(pending.imgThumb);
+  if (refCount && refImages.length) live.setThumbnail(refImages[0].url);
   await finalise(live);
 
   if (!submitted.length) {
@@ -531,11 +533,13 @@ async function handleSd2MultiModal(interaction) {
           await replyToAnchor({
             content: `${user} ${idx + 1}/${submitted.length} rendered but it's ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.`,
           });
+          if (item.jobId) await markJobDelivered(item.jobId, 'sd2');
         } else {
           await replyToAnchor({
             content: `${user} ${idx + 1}/${submitted.length}`,
             files: [new AttachmentBuilder(createReadStream(file.path), { name: `seedance2-${idx + 1}.mp4` })],
           });
+          if (item.jobId) await markJobDelivered(item.jobId, 'sd2');
         }
         console.log(`${item.taskId} (sd2-multi ${idx + 1}/${submitted.length}) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB)`);
       } finally {
@@ -569,398 +573,6 @@ async function handleSd2MultiModal(interaction) {
     .addFields({ name: 'Settings', value: sd2Settings(duration, ratio, resolution) })
     .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
     .setTimestamp());
-}
-
-// â”€â”€â”€ /autobypass â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// Fires 10 Seedance 2.0 renders of the prompt template (intro clip as the
-// reference video), waits for every one, then uses ffmpeg to judge which
-// render has the least intro and delivers that one trimmed to the scene.
-
-const AB_ROOT_DIR = dirname(fileURLToPath(import.meta.url)) + '/..';
-const AB_INTRO_PATH = process.env.AUTOBYPASS_INTRO_PATH || join(AB_ROOT_DIR, 'videointro.mov');
-const AB_COUNT = 4;
-const AB_SUBMIT_CONCURRENCY = 5;
-const AB_DELIVER_CONCURRENCY = 5;
-const AB_DURATION = 15;
-const AB_RESOLUTION = '480p';
-const AB_RATIO = '16:9';
-const AB_PROMPT_TEMPLATE = (userPrompt) =>
-  `a X mask hovering in a white void for 0.2 seconds, then at the 0.3 second mark then the video instantly cuts to ${userPrompt} [refrence Video 1 for how long X mask stays on screen when video turns black that's when cut starts]`;
-const abSettingsLine = (extra = []) =>
-  [`\`${AB_DURATION}s\``, `\`${AB_RATIO}\``, `\`${AB_RESOLUTION}\``, `\`${AB_COUNT} renders\``, ...extra].join(' \u2022 ');
-
-let abRefVideoUrl = process.env.AUTOBYPASS_REF_VIDEO_URL || null;
-const AB_LOGS_CHANNEL_ID = process.env.AUTOBYPASS_LOGS_CHANNEL_ID || '1467759624106152089';
-
-async function ensureRefVideoUrl() {
-  if (abRefVideoUrl) return abRefVideoUrl;
-  const logsChannel = await client.channels.fetch(AB_LOGS_CHANNEL_ID).catch(() => null);
-  if (!logsChannel?.send) {
-    throw new AutoBypassError('The reference clip could not be staged (logs channel missing).');
-  }
-  const msg = await logsChannel.send({
-    content: '\u200b',
-    files: [new AttachmentBuilder(AB_INTRO_PATH, { name: 'videointro.mov' })],
-  });
-  const att = msg.attachments.first();
-  if (!att) throw new AutoBypassError('Could not upload the intro reference clip.');
-  abRefVideoUrl = att.url;
-  return abRefVideoUrl;
-}
-
-async function runAutoBypass(interaction) {
-  const commandName = 'Auto Bypass';
-
-  if (interaction.guildId !== DISCORD_GUILD_ID) {
-    await interaction.reply({ content: 'This bot only works in its home server.', flags: MessageFlags.Ephemeral });
-    return;
-  }
-
-  const user = interaction.user;
-  const jobId = takeSlot(user.id);
-  if (!jobId) {
-    await interaction.reply({
-      content: `You already have ${runningCount(user.id)} of ${MAX_PER_USER} generations running \u2014 wait for one to finish.`,
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
-
-  const userPrompt = interaction.options.getString('prompt', true);
-  const startedAt = Date.now();
-  const { finalise, replyToAnchor, setAnchor } = makeAnchorFns({ interaction });
-
-  const localFiles = [];
-  const cleanup = async () => {
-    await Promise.all(localFiles.splice(0).map((p) => safeUnlink(p)));
-  };
-
-  try {
-    await interaction.deferReply();
-
-    const { images: imgAtts, error: refError } = collectReferences(
-      interaction, ['img1', 'img2', 'img3'], SD2_MAX_IMAGES, [], 0,
-    );
-    if (refError) {
-      await interaction.editReply({ content: refError });
-      return;
-    }
-    const refCount = imgAtts?.length ?? 0;
-
-    const firing = new EmbedBuilder()
-      .setColor(COLOR_WORKING)
-      .setAuthor({ name: commandName })
-      .setTitle(`Firing ${AB_COUNT} bypass renders`)
-      .setDescription(`>>> ${truncate(userPrompt, 900)}`)
-      .addFields({ name: 'Settings', value: abSettingsLine() })
-      .setFooter({ text: `Requested by ${user.username} \u2022 submitting\u2026`, iconURL: user.displayAvatarURL() })
-      .setTimestamp();
-    if (refCount) {
-      firing.addFields({ name: 'References', value: `${refCount} image${refCount > 1 ? 's' : ''}` });
-      firing.setThumbnail(imgAtts[0].url);
-    }
-    const anchor = await interaction.editReply({ embeds: [firing] });
-    setAnchor(anchor);
-
-    const refUrl = await ensureRefVideoUrl();
-    const finalPrompt = AB_PROMPT_TEMPLATE(userPrompt);
-    const references = [
-      { type: 'video', url: refUrl },
-      ...(imgAtts ?? []).map((a) => ({ type: 'image', url: a.url })),
-    ];
-
-    const submitted = [];
-    let submitBlocked = 0;
-    let submitFailed = 0;
-
-    await runPool(AB_COUNT, AB_SUBMIT_CONCURRENCY, async (i) => {
-      try {
-        const { taskId } = await sd2.createTask({
-          prompt: finalPrompt,
-          duration: AB_DURATION,
-          resolution: AB_RESOLUTION,
-          ratio: AB_RATIO,
-          references,
-        });
-        submitted.push({ i, taskId });
-      } catch (err) {
-        if (err?.blocked) submitBlocked += 1;
-        else submitFailed += 1;
-        console.error(`[autobypass] submit ${i + 1}/${AB_COUNT} failed: ${err?.message ?? err}`);
-      }
-    });
-
-    const live = new EmbedBuilder()
-      .setColor(COLOR_WORKING)
-      .setAuthor({ name: commandName })
-      .setTitle(submitted.length ? `All of them are generating!` : 'Could not start renders')
-      .setDescription(`>>> ${truncate(userPrompt, 900)}`)
-      .addFields({
-        name: 'Status',
-        value: submitted.length
-          ? `Submitted ${submitted.length} of ${AB_COUNT}. Waiting on the renders.`
-          : 'Every submit failed \u2014 nothing is running.',
-      })
-      .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
-      .setTimestamp();
-    await finalise(live);
-
-    if (!submitted.length) {
-      if (submitBlocked >= AB_COUNT) {
-        await finalise(new EmbedBuilder()
-          .setColor(COLOR_BLOCKED)
-          .setAuthor({ name: commandName })
-          .setTitle('All videos were content violation, try again')
-          .setDescription(`>>> ${truncate(userPrompt, 900)}`)
-          .addFields({ name: 'Settings', value: abSettingsLine() })
-          .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
-          .setTimestamp());
-      } else {
-        await handleGenerationError(new Error('Could not start any renders.'), {
-          finalise, replyToAnchor, prompt: userPrompt, user,
-          idRef: { value: null }, commandName, idLabel: 'ID',
-        });
-      }
-      return;
-    }
-
-    // Persist before waiting so a restart / kill mid-batch resumes on next boot.
-    try {
-      await jobStore.save({
-        jobId,
-        kind: 'autobypass',
-        userId: user.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-        anchorMessageId: anchor.id,
-        prompt: userPrompt,
-        taskIds: submitted.map((s) => s.taskId),
-        submittedCount: submitted.length,
-        deadlineAt: Date.now() + VIDEO_TIMEOUT,
-        createdAt: Date.now(),
-      });
-    } catch (err) {
-      console.warn(`Could not persist autobypass job ${jobId}: ${err?.message ?? err}`);
-    }
-
-    const successes = [];
-    let genViolations = submitBlocked;
-    let genFailed = submitFailed;
-
-    await runPool(submitted.length, AB_DELIVER_CONCURRENCY, async (idx) => {
-      const item = submitted[idx];
-      try {
-        const { videoUrl } = await sd2.waitForTask(item.taskId, {
-          intervalMs: POLL_MS, timeoutMs: VIDEO_TIMEOUT, onUpdate: () => {},
-        });
-        const file = await sd2.downloadFile(videoUrl);
-        localFiles.push(file.path);
-        successes.push({ i: item.i, path: file.path, bytes: file.bytes });
-        console.log(`[autobypass] ${item.taskId} (${item.i + 1}/${submitted.length}) rendered (${(file.bytes / MB).toFixed(1)} MB)`);
-      } catch (err) {
-        if (err?.blocked) genViolations += 1;
-        else genFailed += 1;
-        console.error(`[autobypass] render ${item.i + 1}/${submitted.length} failed: ${err?.message ?? err}`);
-      }
-    });
-
-    await finishAutoBypass({
-      user, prompt: userPrompt, guild: interaction.guild,
-      successes, violations: genViolations, failed: genFailed,
-      total: submitted.length, startedAt, finalise, replyToAnchor, localFiles,
-    });
-  } catch (err) {
-    if (!(err instanceof AutoBypassError)) console.error(err);
-    try {
-      await handleGenerationError(err, {
-        finalise, replyToAnchor, prompt: userPrompt, user,
-        idRef: { value: null }, commandName, idLabel: 'ID',
-      });
-    } catch (fatal) {
-      console.error(`Unhandled error in ${commandName} for ${user.tag}:`, fatal);
-      try {
-        const body = { content: 'Something went wrong starting that generation.' };
-        if (interaction.deferred || interaction.replied) await interaction.editReply(body);
-        else await interaction.reply({ ...body, flags: MessageFlags.Ephemeral });
-      } catch { /* interaction unusable */ }
-    }
-  } finally {
-    await cleanup();
-    releaseSlot(user.id, jobId);
-    await jobStore.remove(jobId);
-  }
-}
-
-// Shared tail for /autobypass: judge the downloaded renders, trim the winner,
-// deliver. Used by both the fresh run and the restart-resume path.
-async function finishAutoBypass({
-  user, prompt, guild, successes, violations, failed, total, startedAt,
-  finalise, replyToAnchor, localFiles,
-}) {
-  const commandName = 'Auto Bypass';
-
-  if (!successes.length) {
-    if (violations >= total) {
-      await finalise(new EmbedBuilder()
-        .setColor(COLOR_BLOCKED)
-        .setAuthor({ name: commandName })
-        .setTitle('All videos were content violation, try again')
-        .setDescription(`>>> ${truncate(prompt, 900)}`)
-        .addFields({ name: 'Settings', value: abSettingsLine() })
-        .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL?.() })
-        .setTimestamp());
-    } else {
-      await handleGenerationError(new Error('None of the renders finished.'), {
-        finalise, replyToAnchor, prompt, user,
-        idRef: { value: null }, commandName, idLabel: 'ID',
-      });
-    }
-    return;
-  }
-
-  const judging = new EmbedBuilder()
-    .setColor(COLOR_WORKING)
-    .setAuthor({ name: commandName })
-    .setTitle('Judging the renders')
-    .setDescription(`>>> ${truncate(prompt, 900)}`)
-    .addFields({
-      name: 'Status',
-      value: `${successes.length} of ${total} rendered. Detecting the scene cut with ffmpeg\u2026`,
-    })
-    .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL?.() })
-    .setTimestamp();
-  await finalise(judging);
-
-  const candidates = [];
-  for (const s of successes) {
-    try {
-      const { sceneStart, method } = await analyzeVideo(s.path);
-      candidates.push({ ...s, sceneStart, method });
-      console.log(`[autobypass] render ${s.i + 1}: sceneStart=${sceneStart === null ? '??' : sceneStart.toFixed(3)} (${method})`);
-    } catch (err) {
-      console.error(`[autobypass] analyze render ${s.i + 1} failed: ${err?.message ?? err}`);
-      candidates.push({ ...s, sceneStart: null, method: 'error' });
-    }
-  }
-
-  const measurable = candidates.filter((c) => c.sceneStart !== null);
-  const best = measurable.length
-    ? measurable.reduce((a, b) => (b.sceneStart < a.sceneStart ? b : a))
-    : candidates[0];
-  const trimmedOk = best.sceneStart !== null;
-
-  let deliverPath = best.path;
-  if (trimmedOk) {
-    const trimmedPath = await trimVideo(best.path, best.sceneStart);
-    localFiles.push(trimmedPath);
-    deliverPath = trimmedPath;
-  }
-
-  const introCut = trimmedOk ? best.sceneStart : 0;
-  const sceneLen = trimmedOk ? Math.max(0, AB_DURATION - best.sceneStart) : AB_DURATION;
-  const violationNote = violations ? `${violations} of ${total} renders were content violations.` : null;
-  const failedNote = failed ? `${failed} of ${total} renders failed.` : null;
-
-  const done = new EmbedBuilder()
-    .setColor(COLOR_DONE)
-    .setAuthor({ name: commandName })
-    .setTitle('Bypass complete')
-    .setDescription(`>>> ${truncate(prompt, 900)}`)
-    .addFields(
-      { name: 'Settings', value: abSettingsLine([`\`${fmtElapsed(Date.now() - startedAt)}\``]) },
-      { name: 'Winner', value: `Render #${best.i + 1} of ${total} \u2014 least intro` },
-      { name: 'Trim', value: trimmedOk
-        ? `Cut \`${introCut.toFixed(2)}s\` of intro \u2022 \`${sceneLen.toFixed(2)}s\` of clean scene`
-        : 'Could not detect the intro \u2014 delivering the render untrimmed' },
-    )
-    .setFooter({
-      text: [`Requested by ${user.username}`, violationNote, failedNote].filter(Boolean).join(' \u2022 '),
-      iconURL: user.displayAvatarURL?.(),
-    })
-    .setTimestamp();
-  await finalise(done);
-
-  const limit = uploadLimitBytes(guild);
-  const mb = (best.bytes / MB).toFixed(1);
-  if (best.bytes >= limit) {
-    await replyToAnchor({ content: `${user} The trimmed video is ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
-  } else {
-    await replyToAnchor({
-      content: `${user}`,
-      files: [new AttachmentBuilder(createReadStream(deliverPath), { name: 'autobypass-video.mp4' })],
-    });
-  }
-  console.log(`[autobypass] delivered render ${best.i + 1}/${total} (cut ${introCut.toFixed(2)}s) in ${fmtElapsed(Date.now() - startedAt)}`);
-}
-
-// Restart recovery for /autobypass: the batch was persisted right after the
-// submits, so re-poll every task id and run the same judge + trim + deliver.
-async function resumeAutoBypass(rec, { user, prompt, channel, finalise, replyToAnchor }) {
-  const localFiles = [];
-  const cleanup = async () => {
-    await Promise.all(localFiles.splice(0).map((p) => safeUnlink(p)));
-  };
-  const startedAt = Date.now();
-  try {
-    try {
-      await finalise(new EmbedBuilder()
-        .setColor(COLOR_WORKING)
-        .setAuthor({ name: 'Auto Bypass' })
-        .setTitle('Resuming your bypass run')
-        .setDescription(`>>> ${truncate(prompt, 900)}`)
-        .addFields({ name: 'Status', value: 'Picked this back up after a restart \u2014 re-polling the renders.' })
-        .setFooter({ text: user ? `Requested by ${user.username}` : 'Recovered after a restart', iconURL: user?.displayAvatarURL?.() })
-        .setTimestamp());
-    } catch { /* cosmetic */ }
-
-    const remaining = (rec.deadlineAt ?? 0) - Date.now();
-    if (remaining <= 0 || !Array.isArray(rec.taskIds) || !rec.taskIds.length) {
-      await handleGenerationError(
-        new Sd2Error(`Generation timed out after ${Math.max(1, Math.round(VIDEO_TIMEOUT / 60_000))} minutes.`, { timedOut: true }),
-        { finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId), idRef: { value: null }, commandName: 'Auto Bypass', idLabel: 'ID' },
-      );
-      return;
-    }
-
-    const successes = [];
-    let violations = 0;
-    let failed = 0;
-    const total = rec.taskIds.length;
-
-    await runPool(total, AB_DELIVER_CONCURRENCY, async (idx) => {
-      const taskId = rec.taskIds[idx];
-      try {
-        const { videoUrl } = await sd2.waitForTask(taskId, {
-          intervalMs: POLL_MS, timeoutMs: remaining, onUpdate: () => {},
-        });
-        const file = await sd2.downloadFile(videoUrl);
-        localFiles.push(file.path);
-        successes.push({ i: idx, path: file.path, bytes: file.bytes });
-        console.log(`[autobypass-resume] ${taskId} (${idx + 1}/${total}) rendered`);
-      } catch (err) {
-        if (err?.blocked) violations += 1;
-        else failed += 1;
-        console.error(`[autobypass-resume] render ${idx + 1}/${total} failed: ${err?.message ?? err}`);
-      }
-    });
-
-    await finishAutoBypass({
-      user: user ?? resumeUser(null, rec.userId), prompt, guild: channel.guild ?? null,
-      successes, violations, failed, total, startedAt, finalise, replyToAnchor, localFiles,
-    });
-  } catch (err) {
-    try {
-      await handleGenerationError(err, {
-        finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId),
-        idRef: { value: null }, commandName: 'Auto Bypass', idLabel: 'ID',
-      });
-    } catch (fatal) {
-      console.error(`Resume autobypass ${rec.jobId} delivery failed:`, fatal);
-    }
-  } finally {
-    await cleanup();
-    await jobStore.remove(rec.jobId);
-  }
 }
 
 // â”€â”€â”€ /sd2 generation handler (Seedance 2.0 via Volcengine ARK) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -999,7 +611,7 @@ async function runSd2Generation(interaction) {
     const resolution = interaction.options.getString('resolution') ?? SD2_DEFAULT_RESOLUTION;
     const ratio = interaction.options.getString('ratio') ?? SD2_DEFAULT_RATIO;
 
-    const { images: imgAtts, videos: vidAtts, references, error: refError } = collectReferences(
+    const { images: imgAtts, videos: vidAtts, error: refError } = collectReferences(
       interaction, ['img1', 'img2', 'img3'], SD2_MAX_IMAGES, ['vid1'], SD2_MAX_VIDEOS,
     );
     if (refError) {
@@ -1029,14 +641,18 @@ async function runSd2Generation(interaction) {
     const anchor = await interaction.editReply({ embeds: [preparing] });
     setAnchor(anchor);
 
-    const { taskId } = await sd2.createTask({ prompt, duration, resolution, ratio, references });
+    const { taskId } = await sd2.createTask({
+      prompt, duration, resolution, ratio,
+      images: imgAtts ?? [], videos: vidAtts ?? [],
+    });
     idRef.value = taskId;
 
     try {
       await jobStore.save({
         jobId, kind: 'sd2', userId: user.id, guildId: interaction.guildId,
         channelId: interaction.channelId, anchorMessageId: anchor.id,
-        prompt, duration, ratio, resolution, refCount, taskId,
+        prompt, duration, ratio, resolution,
+        refImages: imgAtts?.length ?? 0, refVideos: vidAtts?.length ?? 0, taskId,
         deadlineAt: startedAt + VIDEO_TIMEOUT, createdAt: startedAt,
       });
     } catch (err) {
@@ -1090,9 +706,11 @@ async function runSd2Generation(interaction) {
 
       if (file.bytes >= limit) {
         await replyToAnchor({ content: `${user}\nYour video rendered but it's ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
+        await markJobDelivered(jobId, 'sd2');
         console.log(`${idRef.value} (sd2) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, over limit)`);
       } else {
         await replyToAnchor({ content: `${user}`, files: [new AttachmentBuilder(createReadStream(file.path), { name: 'seedance2-video.mp4' })] });
+        await markJobDelivered(jobId, 'sd2');
         console.log(`${idRef.value} (sd2) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, attached)`);
       }
     } finally {
@@ -1105,6 +723,7 @@ async function runSd2Generation(interaction) {
         prompt: interaction.options.getString('prompt') ?? '',
         user, idRef, commandName, idLabel: 'Task ID',
       });
+      await markJobDelivered(jobId, 'sd2');
     } catch (fatal) {
       console.error(`Unhandled error in ${commandName} for ${user.tag}:`, fatal);
       try {
@@ -1119,6 +738,166 @@ async function runSd2Generation(interaction) {
   }
 }
 
+
+// ─── /sd2-5 generation handler (Seedance 2.5) ────────────────────────────────
+// Reference images and video are uploaded to the proxy and passed as
+// reference_images / reference_videos.
+
+async function runSd25Generation(interaction) {
+  const commandName = 'Seedance 2.5';
+
+  if (interaction.guildId !== DISCORD_GUILD_ID) {
+    await interaction.reply({ content: 'This bot only works in its home server.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const user = interaction.user;
+  const jobId = takeSlot(user.id);
+  if (!jobId) {
+    await interaction.reply({
+      content: `You already have ${runningCount(user.id)} of ${MAX_PER_USER} generations running \u2014 wait for one to finish.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const idRef = { value: null };
+  const startedAt = Date.now();
+  const { finalise, replyToAnchor, setAnchor } = makeAnchorFns({ interaction });
+  const sd25Settings = (d, rt, res, extra = []) => [`\`${d}s\``, `\`${rt}\``, `\`${res}\``, ...extra].join(' \u2022 ');
+
+  try {
+    const prompt = interaction.options.getString('prompt', true);
+    const duration = interaction.options.getInteger('duration') ?? SD25_DEFAULT_DURATION;
+    const resolution = interaction.options.getString('resolution') ?? SD25_DEFAULT_RESOLUTION;
+    const ratio = interaction.options.getString('ratio') ?? SD25_DEFAULT_RATIO;
+
+    const { images: imgAtts, videos: vidAtts, error: refError } = collectReferences(
+      interaction, ['img1', 'img2', 'img3'], SD25_MAX_IMAGES, ['vid1'], SD25_MAX_VIDEOS,
+    );
+    if (refError) {
+      await interaction.reply({ content: refError, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const refCount = (imgAtts?.length ?? 0) + (vidAtts?.length ?? 0);
+
+    await interaction.deferReply();
+
+    const preparing = new EmbedBuilder()
+      .setColor(COLOR_WORKING)
+      .setAuthor({ name: commandName })
+      .setTitle('Preparing your request')
+      .setDescription(`>>> ${truncate(prompt, 900)}`)
+      .addFields({ name: 'Settings', value: sd25Settings(duration, ratio, resolution) })
+      .setFooter({ text: `Requested by ${user.username} \u2022 submitting\u2026`, iconURL: user.displayAvatarURL() })
+      .setTimestamp();
+    if (refCount) {
+      const refSummary = [
+        imgAtts.length ? `${imgAtts.length} image${imgAtts.length > 1 ? 's' : ''}` : null,
+        vidAtts.length ? `${vidAtts.length} video${vidAtts.length > 1 ? 's' : ''}` : null,
+      ].filter(Boolean).join(', ');
+      preparing.addFields({ name: 'References', value: refSummary });
+      if (imgAtts.length) preparing.setThumbnail(imgAtts[0].url);
+    }
+    const anchor = await interaction.editReply({ embeds: [preparing] });
+    setAnchor(anchor);
+
+    const { taskId } = await sd25.createTask({
+      prompt, duration, resolution, ratio,
+      images: imgAtts ?? [], videos: vidAtts ?? [],
+    });
+    idRef.value = taskId;
+
+    try {
+      await jobStore.save({
+        jobId, kind: 'sd25', userId: user.id, guildId: interaction.guildId,
+        channelId: interaction.channelId, anchorMessageId: anchor.id,
+        prompt, duration, ratio, resolution,
+        refImages: imgAtts?.length ?? 0, refVideos: vidAtts?.length ?? 0, taskId,
+        deadlineAt: startedAt + VIDEO_TIMEOUT, createdAt: startedAt,
+      });
+    } catch (err) {
+      console.warn(`Could not persist sd25 job ${jobId}: ${err?.message ?? err}`);
+    }
+
+    const working = new EmbedBuilder()
+      .setColor(COLOR_WORKING)
+      .setAuthor({ name: commandName })
+      .setTitle('Generating your video')
+      .setDescription(`>>> ${truncate(prompt, 900)}`)
+      .addFields({ name: 'Settings', value: sd25Settings(duration, ratio, resolution) })
+      .setFooter({ text: `Requested by ${user.username} \u2022 this takes a few minutes`, iconURL: user.displayAvatarURL() })
+      .setTimestamp();
+    if (refCount) {
+      const refSummary = [
+        imgAtts.length ? `${imgAtts.length} image${imgAtts.length > 1 ? 's' : ''}` : null,
+        vidAtts.length ? `${vidAtts.length} video${vidAtts.length > 1 ? 's' : ''}` : null,
+      ].filter(Boolean).join(', ');
+      working.addFields({ name: 'References', value: refSummary });
+      if (imgAtts.length) working.setThumbnail(imgAtts[0].url);
+    }
+    await finalise(working);
+
+    const { videoUrl } = await sd25.waitForTask(taskId, { intervalMs: POLL_MS, timeoutMs: VIDEO_TIMEOUT, onUpdate: () => {} });
+
+    const file = await sd25.downloadFile(videoUrl);
+    try {
+      const limit = uploadLimitBytes(interaction.guild);
+      const mb = (file.bytes / MB).toFixed(1);
+
+      const done = new EmbedBuilder()
+        .setColor(COLOR_DONE)
+        .setAuthor({ name: commandName })
+        .setTitle('Your video is ready')
+        .setDescription(`>>> ${truncate(prompt, 900)}`)
+        .addFields(
+          { name: 'Settings', value: sd25Settings(duration, ratio, resolution, [`\`${fmtElapsed(Date.now() - startedAt)}\``]) },
+          { name: 'Task ID', value: `\`\`\`${idRef.value ?? ''}\`\`\`` },
+        )
+        .setFooter({ text: `Requested by ${user.username}`, iconURL: user.displayAvatarURL() })
+        .setTimestamp();
+      if (refCount) {
+        const refSummary = [
+          imgAtts.length ? `${imgAtts.length} image${imgAtts.length > 1 ? 's' : ''}` : null,
+          vidAtts.length ? `${vidAtts.length} video${vidAtts.length > 1 ? 's' : ''}` : null,
+        ].filter(Boolean).join(', ');
+        done.addFields({ name: 'References', value: refSummary });
+      }
+      await finalise(done);
+
+      if (file.bytes >= limit) {
+        await replyToAnchor({ content: `${user}\nYour video rendered but it's ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
+        await markJobDelivered(jobId, 'sd25');
+        console.log(`${idRef.value} (sd2-5) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, over limit)`);
+      } else {
+        await replyToAnchor({ content: `${user}`, files: [new AttachmentBuilder(createReadStream(file.path), { name: 'seedance25-video.mp4' })] });
+        await markJobDelivered(jobId, 'sd25');
+        console.log(`${idRef.value} (sd2-5) succeeded in ${fmtElapsed(Date.now() - startedAt)} (${mb} MB, attached)`);
+      }
+    } finally {
+      await safeUnlink(file.path);
+    }
+  } catch (err) {
+    try {
+      await handleGenerationError(err, {
+        finalise, replyToAnchor,
+        prompt: interaction.options.getString('prompt') ?? '',
+        user, idRef, commandName, idLabel: 'Task ID',
+      });
+      await markJobDelivered(jobId, 'sd25');
+    } catch (fatal) {
+      console.error(`Unhandled error in ${commandName} for ${user.tag}:`, fatal);
+      try {
+        const body = { content: 'Something went wrong starting that generation.' };
+        if (interaction.deferred || interaction.replied) await interaction.editReply(body);
+        else await interaction.reply({ ...body, flags: MessageFlags.Ephemeral });
+      } catch { /* interaction unusable */ }
+    }
+  } finally {
+    releaseSlot(user.id, jobId);
+    await jobStore.remove(jobId);
+  }
+}
 
 // ─── /wan-3 generation handler (WAN 3.0) ─────────────────────────────────────
 // Resolution rides as parameters.resolution ('480P'/'720P') — native output, no
@@ -1475,8 +1254,8 @@ async function resumeOne(rec) {
 
   if (rec.kind === 'flux') return resumeFlux(rec, { user, prompt, channel, finalise, replyToAnchor });
   if (rec.kind === 'sd2') return resumeSd2(rec, { user, prompt, channel, finalise, replyToAnchor });
+  if (rec.kind === 'sd25') return resumeSd25(rec, { user, prompt, channel, finalise, replyToAnchor });
   if (rec.kind === 'wan') return resumeWan(rec, { user, prompt, channel, finalise, replyToAnchor });
-  if (rec.kind === 'autobypass') return resumeAutoBypass(rec, { user, prompt, channel, finalise, replyToAnchor });
 
   // Unknown / removed provider — cannot resume; drop it.
   console.warn(`Resume ${rec.jobId}: unsupported kind '${rec.kind ?? 'legacy'}', dropping.`);
@@ -1623,13 +1402,19 @@ async function resumeSd2(rec, { user, prompt, channel, finalise, replyToAnchor }
         )
         .setFooter({ text: user ? `Requested by ${user.username}` : 'Recovered after a restart', iconURL: user?.displayAvatarURL?.() })
         .setTimestamp();
+      if (rec.refImages || rec.refVideos) {
+        const refSummary = [rec.refImages ? `${rec.refImages} image${rec.refImages > 1 ? 's' : ''}` : null, rec.refVideos ? `${rec.refVideos} video${rec.refVideos > 1 ? 's' : ''}` : null].filter(Boolean).join(', ');
+        if (refSummary) done.addFields({ name: 'References', value: refSummary });
+      }
       await finalise(done);
 
       if (file.bytes >= limit) {
         await replyToAnchor({ content: `${mention}\nYour video rendered but it's ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
+        await markJobDelivered(rec.jobId, 'sd2');
         console.log(`${rec.taskId} (sd2 resumed) succeeded (${mb} MB, over limit)`);
       } else {
         await replyToAnchor({ content: `${mention}`, files: [new AttachmentBuilder(createReadStream(file.path), { name: 'seedance2-video.mp4' })] });
+        await markJobDelivered(rec.jobId, 'sd2');
         console.log(`${rec.taskId} (sd2 resumed) succeeded (${mb} MB, attached)`);
       }
     } finally {
@@ -1638,6 +1423,7 @@ async function resumeSd2(rec, { user, prompt, channel, finalise, replyToAnchor }
   } catch (err) {
     try {
       await handleGenerationError(err, { finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId), idRef, commandName: 'Seedance 2.0', idLabel: 'Task ID' });
+      await markJobDelivered(rec.jobId, 'sd2');
     } catch (fatal) {
       console.error(`Resume sd2 ${rec.jobId} delivery failed:`, fatal);
     }
@@ -1721,6 +1507,79 @@ async function resumeWan(rec, { user, prompt, channel, finalise, replyToAnchor }
       await markJobDelivered(rec.jobId);
     } catch (fatal) {
       console.error(`Resume wan ${rec.jobId} delivery failed:`, fatal);
+    }
+  } finally {
+    await jobStore.remove(rec.jobId);
+  }
+}
+
+async function resumeSd25(rec, { user, prompt, channel, finalise, replyToAnchor }) {
+  const idRef = { value: rec.taskId };
+  const sd25Settings = (d, rt, res, extra = []) => [`\`${d}s\``, `\`${rt}\``, `\`${res}\``, ...extra].join(' \u2022 ');
+  try {
+    const remaining = (rec.deadlineAt ?? 0) - Date.now();
+    if (remaining <= 0) {
+      await handleGenerationError(
+        new Sd2Error(`Generation timed out after ${Math.max(1, Math.round(VIDEO_TIMEOUT / 60_000))} minutes.`, { timedOut: true }),
+        { finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId), idRef, commandName: 'Seedance 2.5', idLabel: 'Task ID' },
+      );
+      return;
+    }
+
+    try {
+      await finalise(new EmbedBuilder()
+        .setColor(COLOR_WORKING)
+        .setAuthor({ name: 'Seedance 2.5' })
+        .setTitle('Resuming your video')
+        .setDescription(`>>> ${truncate(prompt, 900)}`)
+        .addFields({ name: 'Status', value: 'Picked this back up after a restart \u2014 still working on it.' })
+        .setFooter({ text: user ? `Requested by ${user.username}` : 'Recovered after a restart', iconURL: user?.displayAvatarURL?.() })
+        .setTimestamp());
+    } catch { /* cosmetic */ }
+
+    const { videoUrl } = await sd25.waitForTask(rec.taskId, { intervalMs: POLL_MS, timeoutMs: remaining, onUpdate: () => {} });
+
+    const file = await sd25.downloadFile(videoUrl);
+    try {
+      const limit = uploadLimitBytes(channel.guild ?? null);
+      const mb = (file.bytes / MB).toFixed(1);
+      const mention = user ? `${user}` : `<@${rec.userId}>`;
+
+      const done = new EmbedBuilder()
+        .setColor(COLOR_DONE)
+        .setAuthor({ name: 'Seedance 2.5' })
+        .setTitle('Your video is ready')
+        .setDescription(`>>> ${truncate(prompt, 900)}`)
+        .addFields(
+          { name: 'Settings', value: sd25Settings(rec.duration, rec.ratio, rec.resolution, ['`recovered`']) },
+          { name: 'Task ID', value: `\`\`\`${rec.taskId ?? ''}\`\`\`` },
+        )
+        .setFooter({ text: user ? `Requested by ${user.username}` : 'Recovered after a restart', iconURL: user?.displayAvatarURL?.() })
+        .setTimestamp();
+      if (rec.refCount) {
+        const refSummary = [rec.refImages ? `${rec.refImages} image${rec.refImages > 1 ? 's' : ''}` : null, rec.refVideos ? `${rec.refVideos} video${rec.refVideos > 1 ? 's' : ''}` : null].filter(Boolean).join(', ');
+        if (refSummary) done.addFields({ name: 'References', value: refSummary });
+      }
+      await finalise(done);
+
+      if (file.bytes >= limit) {
+        await replyToAnchor({ content: `${mention}\nYour video rendered but it's ${mb} MB, over this server's ${Math.round(limit / MB)} MB upload limit.` });
+        await markJobDelivered(rec.jobId, 'sd25');
+        console.log(`${rec.taskId} (sd2-5 resumed) succeeded (${mb} MB, over limit)`);
+      } else {
+        await replyToAnchor({ content: `${mention}`, files: [new AttachmentBuilder(createReadStream(file.path), { name: 'seedance25-video.mp4' })] });
+        await markJobDelivered(rec.jobId, 'sd25');
+        console.log(`${rec.taskId} (sd2-5 resumed) succeeded (${mb} MB, attached)`);
+      }
+    } finally {
+      await safeUnlink(file.path);
+    }
+  } catch (err) {
+    try {
+      await handleGenerationError(err, { finalise, replyToAnchor, prompt, user: resumeUser(user, rec.userId), idRef, commandName: 'Seedance 2.5', idLabel: 'Task ID' });
+      await markJobDelivered(rec.jobId, 'sd25');
+    } catch (fatal) {
+      console.error(`Resume sd2-5 ${rec.jobId} delivery failed:`, fatal);
     }
   } finally {
     await jobStore.remove(rec.jobId);
